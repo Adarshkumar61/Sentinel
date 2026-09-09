@@ -1,5 +1,5 @@
-# uploads/
-# static/captures/
+uploads/
+static/captures/
 # .venv/
 # # Database
 # *.db
