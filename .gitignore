@@ -1,3 +1,7 @@
 uploads/
 static/captures/
 .venv/
+# Database
+*.db
+# model weights
+*.pt
