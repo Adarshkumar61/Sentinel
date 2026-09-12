@@ -1,6 +1,7 @@
-uploads/
-static/captures/
+# uploads/
+# static/captures/
 .venv/
+.env
 # Database
 *.db
 # model weights

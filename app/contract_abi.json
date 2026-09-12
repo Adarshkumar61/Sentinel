@@ -1,0 +1,5 @@
+[
+  {"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"eventId","type":"bytes32"},{"indexed":false,"internalType":"bytes32","name":"evidenceHash","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"timestamp","type":"uint256"},{"indexed":true,"internalType":"address","name":"registeredBy","type":"address"}],"name":"EvidenceRegistered","type":"event"},
+  {"inputs":[{"internalType":"bytes32","name":"eventId","type":"bytes32"}],"name":"getEvidence","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"},{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+  {"inputs":[{"internalType":"bytes32","name":"eventId","type":"bytes32"},{"internalType":"bytes32","name":"evidenceHash","type":"bytes32"}],"name":"registerEvidence","outputs":[],"stateMutability":"nonpayable","type":"function"}
+]
