@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -60,7 +61,8 @@ source_status = "Offline"
 # This prevents Telegram/network/disk/SQLite delays from freezing the live frame.
 event_queue = Queue(maxsize=100)
 event_worker_thread = None
-# Used only when a source has no saved zone yet.  Coordinates are normalized
+browser_frame_lock = threading.Lock()
+# Used only when a source has no saved zone yet. Coordinates are normalized
 # and therefore keep the same physical area at every webcam/video resolution.
 DEFAULT_RESTRICTED_ZONE = [[0.62, 0.12], [0.94, 0.12], [0.94, 0.82], [0.62, 0.82]]
 
@@ -94,8 +96,6 @@ def open_capture(source):
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():
             return None, None
-        # A container can open successfully while its codec is unsupported.
-        # Verify that OpenCV can decode a real frame before replacing a live feed.
         for _ in range(20):
             ok, frame = capture.read()
             if ok and frame is not None and frame.size:
@@ -105,10 +105,6 @@ def open_capture(source):
         capture.release()
         return None, None
 
-    # Laptop cameras are not always index 0 (virtual cameras often take it).
-    # Probe briefly and accept only a camera that actually returns a non-empty frame.
-    # DirectShow is typically much more dependable on Windows webcams; MSMF
-    # remains as a fallback for cameras whose drivers require it.
     backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
     for index in range(4):
         for backend in backends:
@@ -116,10 +112,7 @@ def open_capture(source):
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             for _ in range(8):
                 ok, frame = capture.read()
-                # Some blocked/virtual camera drivers report successful reads but
-                # return an all-black buffer. Do not present that as a live feed.
                 if ok and frame is not None and frame.size and (frame.mean() > 2 or frame.std() > 1):
-                    # to avoid treating a black frame as a working camera
                     return capture, index
                 time.sleep(.04)
             capture.release()
@@ -155,17 +148,7 @@ def event_worker():
                 if evidence_file and evidence_file.is_file()
                 else sha256_event(event_id, event_type, camera_name, details)
             )
-            add_event(
-                event_type,
-                camera_name,
-                details,
-                severity,
-                image_path,
-                body_image_path,
-                event_id,
-                evidence_hash,
-                detected_at,
-            )
+            add_event(event_type, camera_name, details, severity, image_path, body_image_path, event_id, evidence_hash, detected_at)
 
             send_telegram_alert(
                 event_type=event_type,
@@ -180,9 +163,6 @@ def event_worker():
                 detected_at=detected_at,
             )
 
-            # Start automatic MST registration after the event is saved
-            # and the first Telegram alert is sent. This runs in its own
-            # background thread so blockchain RPC delays never block AI.
             threading.Thread(
                 target=process_single_blockchain_registration,
                 args=(event_id,),
@@ -190,67 +170,38 @@ def event_worker():
                 name=f"mst-registration-{event_id}",
             ).start()
         except Exception as error:
-            # Alert failures must never stop the camera/AI loop.
             print(f"⚠️ Event worker error: {error}")
         finally:
             event_queue.task_done()
 
+
 def process_single_blockchain_registration(event_id: str):
-    """
-    Automatically register one Sentinel event on MST Testnet
-    using the backend signing wallet.
-    """
+    """Automatically register one Sentinel event on MST Testnet."""
     try:
-        # Prevent duplicate registration attempts.
         if not claim_blockchain_registration(event_id):
             print(f"ℹ️ Blockchain registration already claimed: {event_id}")
             return
 
         event = get_event(event_id)
-
         if not event:
-            mark_blockchain_failed(
-                event_id,
-                "Event was not found after registration claim.",
-            )
+            mark_blockchain_failed(event_id, "Event was not found after registration claim.")
             print(f"⚠️ Event not found for blockchain registration: {event_id}")
             return
 
         if not event.get("evidence_hash"):
-            mark_blockchain_failed(
-                event_id,
-                "Evidence hash is missing."
-            )
+            mark_blockchain_failed(event_id, "Evidence hash is missing.")
             return
 
         print(f"🔄 Registering {event_id} on MST Testnet...")
-
-        result = BlockchainClient().register_evidence(
-            event_id=event_id,
-            evidence_hash=event["evidence_hash"],
-        )
-
-        # Verify the actual transaction against the exact
-        # Sentinel event and evidence hash.
+        result = BlockchainClient().register_evidence(event_id=event_id, evidence_hash=event["evidence_hash"])
         verified = BlockchainClient().verify_registration(
             event_id=event_id,
             evidence_hash=event["evidence_hash"],
             transaction_hash=result["transaction_hash"],
         )
-
-        confirm_blockchain_event(
-            event_id,
-            **verified,
-        )
-
+        confirm_blockchain_event(event_id, **verified)
         updated_event = get_event(event_id)
-
-        print(
-            f"✅ {event_id} VERIFIED ON MST TESTNET: "
-            f"{verified['transaction_hash']}"
-        )
-
-        # Send VERIFIED Telegram notification in background.
+        print(f"✅ {event_id} VERIFIED ON MST TESTNET: {verified['transaction_hash']}")
         threading.Thread(
             target=send_telegram_blockchain_update,
             args=(updated_event,),
@@ -261,10 +212,11 @@ def process_single_blockchain_registration(event_id: str):
     except BlockchainVerificationError as error:
         mark_blockchain_failed(event_id, str(error))
         print(f"❌ MST registration failed for {event_id}: {error}")
-
     except Exception as error:
         mark_blockchain_failed(event_id, str(error))
         print(f"❌ Unexpected MST registration error for {event_id}: {error}")
+
+
 def processing_loop(session_id, source, kind):
     global latest_jpeg, active_capture, camera_error, source_status
     capture, camera_index = open_capture(source)
@@ -289,8 +241,6 @@ def processing_loop(session_id, source, kind):
     def is_active():
         return state.running and session_id == stream_generation and not server_shutdown.is_set()
 
-    # Keep only the newest frame. Old frames are deliberately dropped so
-    # inference cannot build seconds of latency behind the camera.
     frame_queue = deque(maxlen=1)
     queue_lock = threading.Lock()
     capture_done = threading.Event()
@@ -304,11 +254,7 @@ def processing_loop(session_id, source, kind):
                     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 if session_id == stream_generation:
-                    camera_error = (
-                        "Camera disconnected. Use Reconnect to try again."
-                        if kind == "rtsp"
-                        else "No frames received from camera. Try another camera or restart it."
-                    )
+                    camera_error = "Camera disconnected. Use Reconnect to try again." if kind == "rtsp" else "No frames received from camera. Try another camera or restart it."
                     source_status = "Disconnected"
                 break
             with queue_lock:
@@ -321,15 +267,11 @@ def processing_loop(session_id, source, kind):
     while is_active() and not capture_done.is_set():
         with queue_lock:
             frame = frame_queue.pop() if frame_queue else None
-
         if frame is None:
             time.sleep(.003)
             continue
 
-        # IMPORTANT: this is the only work that must stay on the real-time path.
-        # Event saving/SQLite/Telegram are queued to event_worker below.
         annotated, events = state.process(frame)
-
         for event_type, details, severity, face_image, body_image in events:
             try:
                 event_queue.put_nowait({
@@ -341,14 +283,9 @@ def processing_loop(session_id, source, kind):
                     "body_image": body_image,
                 })
             except Exception:
-                # Never block the AI loop because the alert worker is busy.
                 print("⚠️ Event queue full. Alert side-effects skipped.")
 
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            annotated,
-            [cv2.IMWRITE_JPEG_QUALITY, 82],
-        )
+        ok, encoded = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
         if ok:
             with stream_lock:
                 latest_jpeg = encoded.tobytes()
@@ -357,7 +294,6 @@ def processing_loop(session_id, source, kind):
     with capture_lock:
         if active_capture is capture:
             active_capture = None
-
     if session_id == stream_generation:
         state.running = False
         state.person_count = 0
@@ -373,8 +309,6 @@ def release_active_capture():
 
 def start_source(source, name, kind="webcam", key="webcam:0"):
     global worker, latest_jpeg, stream_generation, camera_error, source_kind, source_key, source_status
-    # Serialise source changes. Double-clicking Start or uploading while a
-    # webcam is opening otherwise leaves two readers fighting for the device.
     with source_lock:
         stream_generation += 1
         state.running = False
@@ -384,13 +318,8 @@ def start_source(source, name, kind="webcam", key="webcam:0"):
         with stream_lock:
             latest_jpeg = None
         state.source, state.source_name, state.running = source, name, True
-        # Do not erase the working default zone just because this source has
-        # not been saved in SQLite before. A persisted zone always wins.
         saved_zone = load_zone(key)
-
-
         state.restricted_zone = saved_zone or [point[:] for point in DEFAULT_RESTRICTED_ZONE]
-#This means different cameras/sources can have their own saved zones.
         state.reset_tracking_state()
         source_kind, source_key, source_status = kind, key, "Connecting"
         camera_error = None
@@ -400,7 +329,6 @@ def start_source(source, name, kind="webcam", key="webcam:0"):
 
 
 def save_face_capture(face_image):
-    """Save compact JPEG evidence only when an alert has a detected face."""
     filename = f"face_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
     target = CAPTURES / filename
     cv2.imwrite(str(target), face_image, [cv2.IMWRITE_JPEG_QUALITY, 88])
@@ -408,7 +336,6 @@ def save_face_capture(face_image):
 
 
 def save_body_capture(body_image):
-    """Save a person crop when the detector produced a usable full-body box."""
     filename = f"body_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
     target = CAPTURES / filename
     cv2.imwrite(str(target), body_image, [cv2.IMWRITE_JPEG_QUALITY, 88])
@@ -418,14 +345,8 @@ def save_body_capture(body_image):
 @app.on_event("startup")
 def startup():
     global event_worker_thread
-
     initialise()
-
-    event_worker_thread = threading.Thread(
-        target=event_worker,
-        daemon=True,
-        name="sentinel-event-worker",
-    )
+    event_worker_thread = threading.Thread(target=event_worker, daemon=True, name="sentinel-event-worker")
     event_worker_thread.start()
     print("Sentinel AI started.")
     print("Background event worker started.")
@@ -443,9 +364,8 @@ def dashboard():
     return FileResponse(ROOT / "static" / "index.html")
 
 
-@app.get("/api/status") #This gives the frontend the current Sentinel status.
+@app.get("/api/status")
 def status():
-    # A stopped source must never leave a stale detection in the dashboard.
     people = state.person_count if state.running else 0
     return {"running": state.running, "camera": state.source_name, "source_kind": source_kind, "source_status": source_status, "persons": people, "alerts": total_events(), "crowd_threshold": state.crowd_threshold, "alert_cooldown": state.alert_cooldown, "restricted_zone": state.restricted_zone, "zone_saved": len(state.restricted_zone) >= 3, "error": camera_error}
 
@@ -457,13 +377,7 @@ def events():
 
 @app.get("/api/blockchain/config")
 def blockchain_config():
-    """
-    Return public MST configuration for the frontend.
-
-    BridgeKey is used only for wallet connection/inspection in the UI.
-    Sentinel evidence registration is performed automatically by the
-    backend signing wallet.
-    """
+    """Return public MST configuration; evidence registration is backend-automatic."""
     return public_config()
 
 
@@ -478,8 +392,6 @@ def save_blockchain_submission(event_id: str, receipt: BlockchainReceipt):
         raise HTTPException(404, "Event not found")
     if event.get("verification_status") == "VERIFIED":
         raise HTTPException(409, "This event is already blockchain verified.")
-    # This is intentionally only a recovery marker. Verification still requires
-    # a successful receipt, matching EvidenceRegistered log and getEvidence call.
     mark_blockchain_submitted(event_id, receipt.transaction_hash)
     return {"ok": True, "status": "PENDING"}
 
@@ -535,6 +447,76 @@ def delete_zone():
     return {"ok": True}
 
 
+@app.post("/api/browser/start")
+def start_browser_camera():
+    """Start a browser-owned webcam session; the Render server never opens a physical camera."""
+    global latest_jpeg, stream_generation, camera_error, source_kind, source_key, source_status
+    with source_lock:
+        stream_generation += 1
+        state.running = True
+        state.source = None
+        state.source_name = "Browser Camera"
+        state.reset_tracking_state()
+        saved_zone = load_zone("browser:0")
+        state.restricted_zone = saved_zone or [point[:] for point in DEFAULT_RESTRICTED_ZONE]
+        source_kind = "browser"
+        source_key = "browser:0"
+        source_status = "Streaming / AI analysis active"
+        camera_error = None
+        release_active_capture()
+        with stream_lock:
+            latest_jpeg = None
+    return {"ok": True, "message": "Browser webcam ready."}
+
+
+@app.post("/api/browser/frame")
+async def process_browser_frame(file: UploadFile = File(...)):
+    """Process one browser webcam frame through the same Sentinel AI/event/MST pipeline."""
+    global latest_jpeg, camera_error, source_status
+    if source_kind != "browser" or not state.running:
+        raise HTTPException(409, "Browser webcam is not active.")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(400, "Empty camera frame.")
+
+    frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None or frame.size == 0:
+        raise HTTPException(400, "Invalid JPEG camera frame.")
+
+    with browser_frame_lock:
+        try:
+            annotated, events = state.process(frame)
+            for event_type, details, severity, face_image, body_image in events:
+                try:
+                    event_queue.put_nowait({
+                        "event_type": event_type,
+                        "details": details,
+                        "severity": severity,
+                        "camera_name": "Browser Camera",
+                        "face_image": face_image,
+                        "body_image": body_image,
+                    })
+                except Exception:
+                    print("⚠️ Event queue full. Alert side-effects skipped.")
+
+            ok, encoded = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            if not ok:
+                raise HTTPException(500, "Could not encode processed camera frame.")
+            with stream_lock:
+                latest_jpeg = encoded.tobytes()
+            source_status = "Streaming / AI analysis active"
+            camera_error = None
+        except HTTPException:
+            raise
+        except Exception as error:
+            camera_error = f"Browser camera processing failed: {error}"
+            source_status = "Disconnected"
+            raise HTTPException(500, str(error)) from error
+
+    return {"ok": True}
+
+
 @app.post("/api/camera/start")
 def start_camera():
     if state.running and not isinstance(state.source, str):
@@ -561,11 +543,8 @@ def stop_camera():
 @app.post("/api/events/clear")
 @app.delete("/api/events")
 def delete_events():
-    """Clear alert history and the face evidence captured for those alerts."""
     image_paths = clear_events()
     for image_path in image_paths:
-        # Use only the app-generated filename as a guard against deleting
-        # anything outside the evidence directory.
         target = CAPTURES / Path(image_path).name
         if target.is_file():
             target.unlink()
@@ -578,8 +557,6 @@ async def upload_video(file: UploadFile = File(...)):
     allowed_extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
     if suffix not in allowed_extensions:
         raise HTTPException(400, "Choose a video file: MP4, AVI, MOV, MKV, WebM, or M4V.")
-    # Do not reuse the active filename: Windows cannot always replace a file
-    # while OpenCV still has it open, and doing so can corrupt playback.
     destination = UPLOADS / f"{uuid.uuid4().hex}{suffix}"
     try:
         with destination.open("wb") as out:
@@ -611,10 +588,8 @@ def test_rtsp(camera: RTSPCamera):
 @app.post("/api/rtsp/connect")
 def connect_rtsp(camera: RTSPCamera):
     source = rtsp_url(camera)
-    # Source key deliberately excludes password; no password is saved in SQLite.
     import hashlib
     key = "rtsp:" + hashlib.sha256((camera.name + "|" + camera.url.split("@")[-1]).encode()).hexdigest()[:20]
-#The purpose is to identify the camera without storing the password in SQLite.
     start_source(source, camera.name.strip(), "rtsp", key)
     return {"ok": True, "name": camera.name.strip()}
 
