@@ -32,7 +32,6 @@ def initialise():
             con.execute("ALTER TABLE events ADD COLUMN image_path TEXT")
         if "body_image_path" not in columns:
             con.execute("ALTER TABLE events ADD COLUMN body_image_path TEXT")
-<<<<<<< HEAD
         if "event_id" not in columns:
             con.execute("ALTER TABLE events ADD COLUMN event_id TEXT")
             con.execute("UPDATE events SET event_id = 'SENT-LEGACY-' || id WHERE event_id IS NULL")
@@ -58,8 +57,6 @@ def initialise():
             con.execute("ALTER TABLE events ADD COLUMN blockchain_network TEXT")
         if "blockchain_error" not in columns:
             con.execute("ALTER TABLE events ADD COLUMN blockchain_error TEXT")
-=======
->>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
         con.execute("""CREATE TABLE IF NOT EXISTS source_zones (
             source_key TEXT PRIMARY KEY, zone_json TEXT NOT NULL, updated_at TEXT NOT NULL
         )""")
@@ -84,7 +81,6 @@ def clear_zone(source_key: str):
         con.execute("DELETE FROM source_zones WHERE source_key = ?", (source_key,))
 
 
-<<<<<<< HEAD
 def add_event(event_type: str, camera: str, details: str, severity: str = "warning", image_path: str | None = None, body_image_path: str | None = None, event_id: str | None = None, evidence_hash: str | None = None, created_at: str | None = None):
     now = created_at or datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     with connection() as con:
@@ -148,15 +144,6 @@ def pending_blockchain_events(limit: int = 200):
 def recover_interrupted_registrations():
     with connection() as con:
         con.execute("UPDATE events SET blockchain_status = 'PENDING' WHERE blockchain_status = 'REGISTERING' AND blockchain_tx IS NULL")
-=======
-def add_event(event_type: str, camera: str, details: str, severity: str = "warning", image_path: str | None = None, body_image_path: str | None = None):
-    now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-    with connection() as con:
-        con.execute(
-            "INSERT INTO events (created_at, event_type, camera, details, severity, image_path, body_image_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (now, event_type, camera, details, severity, image_path, body_image_path),
-        )
->>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 
 
 def recent_events(limit: int = 30):
