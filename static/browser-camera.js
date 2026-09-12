@@ -146,7 +146,7 @@
             await sendOneFrame();
             if (!browserSending || browserStopRequested) break;
             await new Promise(resolve => {
-                sendTimer = setTimeout(resolve, 90);
+                sendTimer = setTimeout(resolve, 180);
             });
         }
     }
