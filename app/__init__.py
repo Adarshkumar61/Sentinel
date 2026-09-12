@@ -1,8 +1,6 @@
 # Browser-camera reliability patch.
-# The main application imports VisionState from app.vision after package init runs.
-# We patch only browser mode: YOLO loading is moved off the request path, and a
-# face-based degraded detector keeps the demo functional if YOLO is still loading
-# or unavailable on a constrained Render instance.
+# Patch only browser mode: YOLO loading is moved off the request path, and
+# face evidence can trigger when a person's face/upper body overlaps the zone.
 import threading
 import cv2
 import numpy as np
@@ -39,16 +37,13 @@ def _browser_safe_load_model(self):
 
 def _browser_process_sync(self, frame):
     annotated, events = _original_process_sync(self, frame)
-
-    # If YOLO has not produced a person yet, use the already-installed Haar
-    # face detector as a degraded person detector. This is intentionally only
-    # for browser mode and prevents Render model-loading delays from producing
-    # a misleading permanent PEOPLE: 0 state.
-    if self.source_name != "Browser Camera" or self.person_count > 0 or not self.face_detectors:
+    if self.source_name != "Browser Camera" or not self.face_detectors:
         return annotated, events
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
+    # The original YOLO logic uses the person's foot point for zone entry.
+    # For a browser demo a user often draws the zone around the visible torso,
+    # so also accept the detected face/upper-body overlap with the zone.
+    gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     faces = []
     for detector in self.face_detectors:
         try:
@@ -64,25 +59,28 @@ def _browser_process_sync(self, frame):
     y1 = max(0, int(fy - fh * 0.4))
     y2 = min(frame.shape[0], int(fy + fh * 4.0))
 
+    # Keep the real YOLO count when it exists; otherwise show the degraded
+    # face/person count immediately while YOLO is loading or unavailable.
+    if self.person_count == 0:
+        self.person_count = 1
+        color = (35, 220, 90)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(annotated, "Person (fallback) 99%", (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 2)
+        cv2.putText(annotated, "PEOPLE: 1", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 3)
+        cv2.putText(annotated, "PEOPLE: 1", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (20, 230, 100), 1)
+
     zone = np.array([(int(x * frame.shape[1]), int(y * frame.shape[0])) for x, y in self.restricted_zone], np.int32) if len(self.restricted_zone) == 4 else None
     center = ((x1 + x2) // 2, (y1 + y2) // 2)
     foot = ((x1 + x2) // 2, y2)
     in_zone = zone is not None and (cv2.pointPolygonTest(zone, center, False) >= 0 or cv2.pointPolygonTest(zone, foot, False) >= 0)
 
-    color = (0, 40, 255) if in_zone else (35, 220, 90)
-    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(annotated, "Person (fallback) 99%", (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 2)
-    cv2.putText(annotated, "PEOPLE: 1", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 3)
-    cv2.putText(annotated, "PEOPLE: 1", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (20, 230, 100), 1)
-    self.person_count = 1
-
-    if in_zone and self.should_alert("zone-face-fallback", self.alert_cooldown):
+    if in_zone and not events and self.should_alert("zone-face-overlap", self.alert_cooldown):
         face = self.capture_face(frame, (x1, y1, x2, y2))
         body = self.capture_body(frame, (x1, y1, x2, y2))
-        events.append(("Restricted Area Entry", "Person entered the restricted zone. Face/body evidence captured by fallback detector.", "critical", face, body))
-        self.people_in_zone = {"face-fallback"}
-    else:
-        self.people_in_zone = set()
+        events.append(("Restricted Area Entry", "Person detected inside the restricted zone. Face/body evidence captured.", "critical", face, body))
+        self.people_in_zone = {"face-overlap"}
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 40, 255), 2)
+        cv2.putText(annotated, "RESTRICTED PERSON", (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .48, (0, 40, 255), 2)
 
     return annotated, events
 
