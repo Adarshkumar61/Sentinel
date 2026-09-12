@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # import shutil
 # import threading
 # import time
@@ -384,6 +385,8 @@
 #     if image is None:
 #         return Response(status_code=204, headers={"Cache-Control": "no-store"})
 #     return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "no-store, max-age=0"})
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 import shutil
 import threading
 import time
@@ -397,6 +400,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+<<<<<<< HEAD
 from .telegram_alert import send_telegram_alert, send_telegram_blockchain_update
 from .database import add_event, clear_events, clear_zone, confirm_blockchain_event, get_event, initialise, load_zone, mark_blockchain_submitted, recent_events, save_zone, total_events
 from .blockchain import BlockchainClient, BlockchainVerificationError
@@ -404,6 +408,11 @@ from .blockchain_config import public_config
 from .hashing import sha256_event, sha256_file
 from .vision import VisionState
 from queue import Queue, Empty
+=======
+
+from .database import add_event, clear_events, clear_zone, initialise, load_zone, recent_events, save_zone, total_events
+from .vision import VisionState
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 
 ROOT = Path(__file__).resolve().parent.parent
 UPLOADS = ROOT / "uploads"
@@ -414,7 +423,10 @@ app = FastAPI(title="AI Surveillance Dashboard")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 state = VisionState()
 # state holds the current AI system state.
+<<<<<<< HEAD
 
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 latest_jpeg = None
 stream_lock = threading.Lock()
 worker = None
@@ -427,11 +439,14 @@ camera_error = None
 source_kind = "webcam"
 source_key = "webcam:0"
 source_status = "Offline"
+<<<<<<< HEAD
 
 # Alert side-effects run outside the AI/video processing loop.
 # This prevents Telegram/network/disk/SQLite delays from freezing the live frame.
 event_queue = Queue(maxsize=100)
 event_worker_thread = None
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 # Used only when a source has no saved zone yet.  Coordinates are normalized
 # and therefore keep the same physical area at every webcam/video resolution.
 DEFAULT_RESTRICTED_ZONE = [[0.62, 0.12], [0.94, 0.12], [0.94, 0.82], [0.62, 0.82]]
@@ -440,7 +455,11 @@ DEFAULT_RESTRICTED_ZONE = [[0.62, 0.12], [0.94, 0.12], [0.94, 0.82], [0.62, 0.82
 class Settings(BaseModel):
     crowd_threshold: int = Field(ge=1, le=100)
     restricted_zone: list[list[float]]
+<<<<<<< HEAD
     alert_cooldown: float = Field(default=2, ge=1, le=3600)
+=======
+    alert_cooldown: float = Field(default=4, ge=1, le=3600)
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 
 
 class RTSPCamera(BaseModel):
@@ -498,6 +517,7 @@ def open_capture(source):
     return None, None
 
 
+<<<<<<< HEAD
 def event_worker():
     """Handle evidence, database writes and Telegram without blocking video AI."""
     while not server_shutdown.is_set():
@@ -556,6 +576,8 @@ def event_worker():
             event_queue.task_done()
 
 
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 def processing_loop(session_id, source, kind):
     global latest_jpeg, active_capture, camera_error, source_status
     capture, camera_index = open_capture(source)
@@ -565,34 +587,53 @@ def processing_loop(session_id, source, kind):
             source_status = "Disconnected"
             state.running = False
         return
+<<<<<<< HEAD
 
     if camera_index is not None:
         state.source_name = f"Camera {camera_index + 1}"
 
+=======
+    if camera_index is not None:
+        state.source_name = f"Camera {camera_index + 1}"
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
     with capture_lock:
         if session_id != stream_generation:
             capture.release()
             return
         active_capture = capture
+<<<<<<< HEAD
 
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
     source_status = "Streaming / AI analysis active"
 
     def is_active():
         return state.running and session_id == stream_generation and not server_shutdown.is_set()
+<<<<<<< HEAD
 
     # Keep only the newest frame. Old frames are deliberately dropped so
     # inference cannot build seconds of latency behind the camera.
+=======
+    # A bounded deque is a O(1) queue. It keeps only the newest frame: when
+    # inference is slower than the camera, old frames are dropped instead of
+    # building latency. This is the key difference between a lagging and live feed.
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
     frame_queue = deque(maxlen=1)
     queue_lock = threading.Lock()
     capture_done = threading.Event()
 
     def capture_frames():
+<<<<<<< HEAD
         global camera_error, source_status
+=======
+        global camera_error
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
         while is_active():
             ok, frame = capture.read()
             if not ok:
                 if kind == "video" and is_active():
                     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+<<<<<<< HEAD
                     continue
                 if session_id == stream_generation:
                     camera_error = (
@@ -600,14 +641,25 @@ def processing_loop(session_id, source, kind):
                         if kind == "rtsp"
                         else "No frames received from camera. Try another camera or restart it."
                     )
+=======
+                    # to code video ko beginning par le jaata hai:
+                    continue
+                if session_id == stream_generation:
+                    camera_error = "Camera disconnected. Use Reconnect to try again." if kind == "rtsp" else "No frames received from camera. Try another camera or restart it."
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
                     source_status = "Disconnected"
                 break
             with queue_lock:
                 frame_queue.append(frame)
+<<<<<<< HEAD
+=======
+                # Now the newest frame is available to the AI processing loop.
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
         capture_done.set()
 
     grabber = threading.Thread(target=capture_frames, daemon=True)
     grabber.start()
+<<<<<<< HEAD
 
     while is_active() and not capture_done.is_set():
         with queue_lock:
@@ -644,11 +696,33 @@ def processing_loop(session_id, source, kind):
             with stream_lock:
                 latest_jpeg = encoded.tobytes()
 
+=======
+    while is_active() and not capture_done.is_set():
+        with queue_lock:
+            frame = frame_queue.pop() if frame_queue else None
+        if frame is None:
+            time.sleep(.003)
+            continue
+        annotated, events = state.process(frame)
+        for event_type, details, severity, face_image, body_image in events:
+            image_path = save_face_capture(face_image) if face_image is not None else None
+            body_image_path = save_body_capture(body_image) if body_image is not None else None
+            add_event(event_type, state.source_name, details, severity, image_path, body_image_path)
+#   Convert processed frame to JPEG:
+        ok, encoded = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        if ok:
+            with stream_lock:
+                latest_jpeg = encoded.tobytes()
+        # do not sleep here. The next deque item is always the freshest frame
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
     capture.release()
     with capture_lock:
         if active_capture is capture:
             active_capture = None
+<<<<<<< HEAD
 
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
     if session_id == stream_generation:
         state.running = False
         state.person_count = 0
@@ -708,6 +782,7 @@ def save_body_capture(body_image):
 
 @app.on_event("startup")
 def startup():
+<<<<<<< HEAD
     global event_worker_thread
 
     initialise()
@@ -721,6 +796,10 @@ def startup():
     print("Sentinel AI started.")
     print("Background event worker started.")
 
+=======
+    initialise()
+
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 
 @app.on_event("shutdown")
 def shutdown():
@@ -746,6 +825,7 @@ def events():
     return recent_events()
 
 
+<<<<<<< HEAD
 @app.get("/api/blockchain/config")
 def blockchain_config():
     """Public configuration only; BridgeKey signs all transactions in-browser."""
@@ -802,6 +882,8 @@ def verify_blockchain_event(event_id: str):
     return {"ok": True, "verification": verified}
 
 
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 @app.post("/api/settings")
 def save_settings(settings: Settings):
     if len(settings.restricted_zone) < 3 or any(len(point) != 2 or not all(0 <= value <= 1 for value in point) for point in settings.restricted_zone):

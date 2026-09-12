@@ -5,5 +5,8 @@ numpy==2.2.1
 python-multipart==0.0.20
 ultralytics>=8.3.0
 lap>=0.5.12
+<<<<<<< HEAD
 python-dotenv>=1.0.0
 web3>=7.10.0
+=======
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84

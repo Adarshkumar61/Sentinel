@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # """Low-latency YOLOv8 detection and tracking for the surveillance stream."""
 # import threading
 # import time
@@ -206,6 +207,9 @@
 #             return torch.cuda.is_available()
 #         except ImportError:
 #             return False
+=======
+"""Low-latency YOLOv8 detection and tracking for the surveillance stream."""
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
 import threading
 import time
 from dataclasses import dataclass, field
@@ -224,7 +228,11 @@ class VisionState:
     # every incoming frame resolution.
     restricted_zone: list = field(default_factory=lambda: [[0.62, 0.12], [0.94, 0.12], [0.94, 0.82], [0.62, 0.82]])
     crowd_threshold: int = 4
+<<<<<<< HEAD
     alert_cooldown: float = 2.0
+=======
+    alert_cooldown: float = 4.0
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
     person_count: int = 0
     alert_cooldowns: dict = field(default_factory=dict)
     model: object | None = field(default=None, init=False, repr=False)
@@ -412,4 +420,8 @@ class VisionState:
             import torch
             return torch.cuda.is_available()
         except ImportError:
+<<<<<<< HEAD
             return False
+=======
+            return False
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84

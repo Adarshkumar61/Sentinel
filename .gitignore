@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # uploads/
 # static/captures/
 .venv/
@@ -6,3 +7,12 @@
 *.db
 # model weights
 *.pt
+=======
+uploads/
+static/captures/
+.venv/
+# Database
+*.db
+# model weights
+*.pt
+>>>>>>> d2786f805947bf6787b2bf317cab189da3c56d84
