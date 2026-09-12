@@ -30,11 +30,29 @@ class VisionState:
     people_in_zone: set = field(default_factory=set, init=False, repr=False)
     crowd_active: bool = field(default=False, init=False)
 
+    # Browser webcams arrive through HTTP. Do not make the HTTP request wait
+    # for YOLO CPU inference; keep only the newest frame and let one worker
+    # process it in the background. This prevents Render latency from making
+    # the browser camera appear frozen while still using the same AI pipeline.
+    browser_condition: object = field(default_factory=threading.Condition, init=False, repr=False)
+    browser_latest_frame: object = field(default=None, init=False, repr=False)
+    browser_latest_annotated: object = field(default=None, init=False, repr=False)
+    browser_pending_events: list = field(default_factory=list, init=False, repr=False)
+    browser_worker: object = field(default=None, init=False, repr=False)
+    browser_session: int = field(default=0, init=False, repr=False)
+
     def reset_tracking_state(self):
         """Called when a source changes so IDs cannot leak between cameras."""
         self.people_in_zone.clear()
         self.crowd_active = False
         self.alert_cooldowns.clear()
+        # Invalidate any old browser worker/frame when switching sources.
+        with self.browser_condition:
+            self.browser_session += 1
+            self.browser_latest_frame = None
+            self.browser_latest_annotated = None
+            self.browser_pending_events.clear()
+            self.browser_condition.notify_all()
 
     def clear_zone_state(self):
         """A zone replacement must not retain entry state from the old zone."""
@@ -114,8 +132,8 @@ class VisionState:
         body = frame[y1:y2, x1:x2]
         return body.copy() if body.size else None
 
-    def process(self, frame):
-        """Run one YOLO frame. ByteTrack keeps IDs without custom O(n²) matching."""
+    def _process_sync(self, frame):
+        """Run one complete YOLO frame synchronously in the AI worker."""
         self.load_model()
         raw_frame = frame
         height, width = frame.shape[:2]
@@ -159,11 +177,11 @@ class VisionState:
         for coordinates, class_id, track_id, confidence in detections:
             # OpenCV's Python bindings do not reliably accept NumPy scalar
             # values for a point tuple on every build. Convert detector output
-            # to native Python ints before passing it to drawing/geometry APIs.
+            # to native Python ints before passing to drawing/geometry APIs.
             x1, y1, x2, y2 = (int(value) for value in coordinates)
             label = self.class_names.get(class_id, str(class_id)).title()
             is_person = class_id == 0
-            foot_point = ((x1 + x2) // 2, y2) 
+            foot_point = ((x1 + x2) // 2, y2)
             in_zone = is_person and zone is not None and cv2.pointPolygonTest(zone, foot_point, False) >= 0
             color = (0, 40, 255) if in_zone else ((35, 220, 90) if is_person else (255, 185, 40))
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -198,6 +216,66 @@ class VisionState:
         cv2.putText(frame, f"PEOPLE: {people}", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 3)
         cv2.putText(frame, f"PEOPLE: {people}", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (20, 230, 100), 1)
         return frame, events
+
+    def _browser_worker_loop(self, session):
+        """Run YOLO independently so /api/browser/frame stays fast."""
+        while self.running and self.source_name == "Browser Camera" and self.browser_session == session:
+            with self.browser_condition:
+                while (
+                    self.browser_latest_frame is None
+                    and self.running
+                    and self.source_name == "Browser Camera"
+                    and self.browser_session == session
+                ):
+                    self.browser_condition.wait(timeout=0.5)
+                if not self.running or self.source_name != "Browser Camera" or self.browser_session != session:
+                    break
+                frame = self.browser_latest_frame
+                self.browser_latest_frame = None
+
+            try:
+                annotated, events = self._process_sync(frame)
+                with self.browser_condition:
+                    self.browser_latest_annotated = annotated
+                    if events:
+                        self.browser_pending_events.extend(events)
+                    self.browser_condition.notify_all()
+            except Exception as error:
+                # Keep the local/browser transport alive even if model inference
+                # fails. The main API can still return the newest camera frame.
+                print(f"⚠️ Browser AI inference error: {error}")
+
+    def _process_browser(self, frame):
+        """Accept a browser frame and return the newest available result."""
+        with self.browser_condition:
+            if self.browser_worker is None or not self.browser_worker.is_alive():
+                session = self.browser_session
+                self.browser_worker = threading.Thread(
+                    target=self._browser_worker_loop,
+                    args=(session,),
+                    daemon=True,
+                    name="sentinel-browser-vision",
+                )
+                self.browser_worker.start()
+            # Latest-frame semantics: never build an inference backlog.
+            self.browser_latest_frame = frame
+            self.browser_condition.notify()
+            annotated = self.browser_latest_annotated
+            events = list(self.browser_pending_events)
+            self.browser_pending_events.clear()
+
+        if annotated is None:
+            # Until the first YOLO result is ready, return the real camera frame.
+            # The browser UI already has a local preview, so this is only a
+            # transport fallback and never blocks camera visibility.
+            annotated = frame.copy()
+        return annotated, events
+
+    def process(self, frame):
+        """Process one frame, using a non-blocking worker for browser webcams."""
+        if self.source_name == "Browser Camera":
+            return self._process_browser(frame)
+        return self._process_sync(frame)
 
     @staticmethod
     def _cuda_available():
