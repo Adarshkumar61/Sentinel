@@ -6,44 +6,79 @@
     let browserStopRequested = false;
     let sendTimer = null;
     let sending = false;
+    let processedStreamReady = false;
 
     const $id = id => document.getElementById(id);
 
-    function setFeedStream(useProcessedStream = true) {
+    function setFeedStream() {
         const stream = $id("stream");
         if (!stream) return;
-        stream.src = useProcessedStream
-            ? "/api/stream?browser=" + Date.now()
-            : "/api/frame?session=" + Date.now();
+        processedStreamReady = false;
+        stream.style.opacity = "0";
+        stream.style.position = "relative";
+        stream.style.zIndex = "2";
+        stream.src = "/api/stream?browser=" + Date.now();
+    }
+
+    function ensureLocalPreview() {
+        const feed = $id("feed");
+        if (!feed) return;
+
+        if (!browserVideo) {
+            browserVideo = document.createElement("video");
+            browserVideo.id = "browserLocalPreview";
+            browserVideo.autoplay = true;
+            browserVideo.playsInline = true;
+            browserVideo.muted = true;
+            browserVideo.setAttribute("aria-label", "Browser webcam preview");
+            Object.assign(browserVideo.style, {
+                position: "absolute",
+                inset: "0",
+                width: "100%",
+                height: "100%",
+                objectFit: "cover",
+                display: "none",
+                zIndex: "1",
+                background: "#040a12"
+            });
+            feed.insertBefore(browserVideo, $id("stream"));
+        }
+
+        browserVideo.style.display = "block";
     }
 
     function stopBrowserMedia() {
         browserSending = false;
         browserStopRequested = true;
         sending = false;
+        processedStreamReady = false;
+
         if (sendTimer) {
             clearTimeout(sendTimer);
             sendTimer = null;
         }
+
         if (browserStream) {
             browserStream.getTracks().forEach(track => track.stop());
             browserStream = null;
         }
+
         if (browserVideo) {
             browserVideo.pause();
             browserVideo.srcObject = null;
+            browserVideo.style.display = "none";
+        }
+
+        const stream = $id("stream");
+        if (stream) {
+            stream.style.opacity = "1";
+            stream.removeAttribute("src");
         }
     }
 
     function makeCaptureElements() {
-        if (!browserVideo) {
-            browserVideo = document.createElement("video");
-            browserVideo.autoplay = true;
-            browserVideo.playsInline = true;
-            browserVideo.muted = true;
-            browserVideo.style.display = "none";
-            document.body.appendChild(browserVideo);
-        }
+        ensureLocalPreview();
+
         if (!browserCanvas) {
             browserCanvas = document.createElement("canvas");
             browserCanvas.style.display = "none";
@@ -58,8 +93,6 @@
                 return;
             }
 
-            // 640px input keeps network + JPEG overhead low while preserving
-            // enough detail for person/foot-point restricted-zone detection.
             const maxWidth = 640;
             const scale = Math.min(1, maxWidth / browserVideo.videoWidth);
             browserCanvas.width = Math.max(1, Math.round(browserVideo.videoWidth * scale));
@@ -98,11 +131,10 @@
             }
         } catch (error) {
             if (browserSending) {
+                console.error("Sentinel browser frame:", error);
                 say(error.message || "Browser frame upload failed.", true);
-                if (error.message.includes("not active")) {
-                    await window.stopCamera();
-                    return;
-                }
+                // Keep the local webcam preview alive. A temporary backend
+                // failure must not make it look like the camera itself died.
             }
         } finally {
             sending = false;
@@ -110,8 +142,6 @@
     }
 
     async function captureLoop() {
-        // Controlled cadence prevents bandwidth/CPU saturation. The backend
-        // accepts frames quickly and keeps only the newest frame for AI work.
         while (browserSending && !browserStopRequested) {
             await sendOneFrame();
             if (!browserSending || browserStopRequested) break;
@@ -146,6 +176,12 @@
             browserVideo.srcObject = browserStream;
             await browserVideo.play();
 
+            // Show the real local webcam immediately. This is independent of
+            // Render/YOLO latency, so the user can never mistake a backend
+            // processing delay for a dead camera.
+            feedState(true);
+            ensureLocalPreview();
+
             const startResult = await endpoint("/api/browser/start", { method: "POST" });
             if (!startResult?.ok) {
                 throw new Error("Server could not start browser camera mode.");
@@ -153,17 +189,14 @@
 
             browserSending = true;
             browserStopRequested = false;
-            feedState(true);
 
-            // Use the long-lived multipart endpoint for the processed display.
-            // This avoids the old 80ms /api/frame polling loop and always shows
-            // the newest annotated AI frame produced by the backend.
             if (typeof stopPreview === "function") stopPreview();
-            setFeedStream(true);
+            setFeedStream();
 
-            say("● BROWSER CAMERA  ● LIVE AI  ● RESTRICTED-ZONE MONITORING");
+            say("● CAMERA LIVE  ● AI ANALYSIS STARTING  ● RESTRICTED-ZONE MONITORING");
             captureLoop();
         } catch (error) {
+            console.error("Sentinel webcam start:", error);
             stopBrowserMedia();
             if (typeof stopPreview === "function") stopPreview();
             feedState(false);
@@ -183,12 +216,26 @@
         try {
             await endpoint("/api/camera/stop", { method: "POST" });
         } catch (error) {
-            say(error.message, true);
+            console.error("Sentinel webcam stop:", error);
         }
         if (typeof stopPreview === "function") stopPreview();
         feedState(false);
         say("Camera stopped.");
     };
+
+    // When the backend's annotated MJPEG stream produces its first frame,
+    // place it over the local preview. Until then the real webcam remains
+    // visible, giving immediate feedback while YOLO warms up.
+    const processedImage = $id("stream");
+    if (processedImage) {
+        processedImage.addEventListener("load", () => {
+            if (browserSending && !processedStreamReady) {
+                processedStreamReady = true;
+                processedImage.style.opacity = "1";
+                say("● CAMERA LIVE  ● AI ANALYSIS ACTIVE  ● RESTRICTED-ZONE MONITORING");
+            }
+        });
+    }
 
     const originalSource = window.source;
     window.source = function browserAwareSource(key) {
