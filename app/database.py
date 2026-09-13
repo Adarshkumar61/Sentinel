@@ -26,7 +26,6 @@ def initialise():
                 body_image_path TEXT
             )"""
         )
-        # Safe migration for databases created before event-photo support.
         columns = {row[1] for row in con.execute("PRAGMA table_info(events)")}
         if "image_path" not in columns:
             con.execute("ALTER TABLE events ADD COLUMN image_path TEXT")
@@ -37,6 +36,8 @@ def initialise():
             con.execute("UPDATE events SET event_id = 'SENT-LEGACY-' || id WHERE event_id IS NULL")
         if "evidence_hash" not in columns:
             con.execute("ALTER TABLE events ADD COLUMN evidence_hash TEXT")
+        if "on_chain_evidence_hash" not in columns:
+            con.execute("ALTER TABLE events ADD COLUMN on_chain_evidence_hash TEXT")
         if "blockchain_tx" not in columns:
             con.execute("ALTER TABLE events ADD COLUMN blockchain_tx TEXT")
         if "blockchain_status" not in columns:
@@ -97,11 +98,11 @@ def get_event(event_id: str):
     return dict(row) if row else None
 
 
-def confirm_blockchain_event(event_id: str, transaction_hash: str, blockchain_event_id: str, registered_at: str, registered_by: str, block_number: int | None = None, contract_address: str | None = None, blockchain_network: str | None = None):
+def confirm_blockchain_event(event_id: str, transaction_hash: str, blockchain_event_id: str, registered_at: str, registered_by: str, block_number: int | None = None, contract_address: str | None = None, blockchain_network: str | None = None, on_chain_evidence_hash: str | None = None):
     with connection() as con:
         con.execute(
-            "UPDATE events SET blockchain_tx = ?, blockchain_event_id = ?, blockchain_status = 'CONFIRMED', verification_status = 'VERIFIED', blockchain_registered_at = ?, registered_by = ?, block_number = ?, contract_address = ?, blockchain_network = ?, blockchain_error = NULL WHERE event_id = ?",
-            (transaction_hash, blockchain_event_id, registered_at, registered_by, block_number, contract_address, blockchain_network, event_id),
+            "UPDATE events SET blockchain_tx = ?, blockchain_event_id = ?, blockchain_status = 'CONFIRMED', verification_status = 'VERIFIED', blockchain_registered_at = ?, registered_by = ?, block_number = ?, contract_address = ?, blockchain_network = ?, on_chain_evidence_hash = ?, blockchain_error = NULL WHERE event_id = ?",
+            (transaction_hash, blockchain_event_id, registered_at, registered_by, block_number, contract_address, blockchain_network, on_chain_evidence_hash, event_id),
         )
 
 
