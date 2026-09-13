@@ -22,20 +22,6 @@ class BlockchainVerificationError(RuntimeError):
     pass
 
 
-# ---------------------------------------------------------------------------
-# Transaction serialization
-# ---------------------------------------------------------------------------
-#
-# Sentinel can detect multiple events close together.
-# All of them use the same backend wallet.
-#
-# A single wallet must not have multiple threads racing to choose/send
-# transactions with the same nonce.
-#
-# Therefore only ONE MST registration transaction is constructed/sent at a
-# time. This keeps automatic registration safe while still being fully
-# unattended.
-#
 _TRANSACTION_LOCK = threading.Lock()
 
 
@@ -46,7 +32,6 @@ class BlockchainClient:
                 "MST blockchain configuration is unavailable."
             )
 
-        # Connect to MST RPC.
         self.w3 = Web3(
             Web3.HTTPProvider(
                 MST_RPC_URL,
@@ -54,26 +39,14 @@ class BlockchainClient:
             )
         )
 
-        # ------------------------------------------------------------------
-        # MST Testnet uses a POA-style block header with extended extraData.
-        #
-        # Without this middleware Web3.py can throw:
-        #
-        # "The field extraData is 97 bytes, but should be 32"
-        #
-        # Web3.py requires ExtraDataToPOAMiddleware at layer 0.
-        # ------------------------------------------------------------------
         self.w3.middleware_onion.inject(
             ExtraDataToPOAMiddleware,
             layer=0,
         )
 
         if not self.w3.is_connected():
-            raise BlockchainVerificationError(
-                "MST RPC is unavailable."
-            )
+            raise BlockchainVerificationError("MST RPC is unavailable.")
 
-        # Verify that the RPC is actually the configured MST chain.
         try:
             connected_chain_id = self.w3.eth.chain_id
         except Exception as error:
@@ -89,102 +62,51 @@ class BlockchainClient:
             )
 
         config = public_config()
-
         self.contract = self.w3.eth.contract(
             address=Web3.to_checksum_address(MST_CONTRACT_ADDRESS),
             abi=config["abi"],
         )
 
-    # ----------------------------------------------------------------------
-    # Helpers
-    # ----------------------------------------------------------------------
-
     @staticmethod
     def _normalise_hash(value: str) -> str:
         """Return a clean lowercase 64-character SHA-256 hex string."""
-
         clean = value.removeprefix("0x").lower()
-
         if len(clean) != 64:
             raise BlockchainVerificationError(
-                "Invalid SHA-256 evidence hash length: "
-                f"{len(clean)}"
+                f"Invalid SHA-256 evidence hash length: {len(clean)}"
             )
-
         try:
             bytes.fromhex(clean)
         except ValueError as error:
             raise BlockchainVerificationError(
                 "Evidence hash is not valid hexadecimal."
             ) from error
-
         return clean
 
     @staticmethod
     def _normalise_tx_hash(tx_hash) -> str:
-        """Convert a Web3 transaction hash into a normal 0x-prefixed string."""
-
         value = tx_hash.hex()
+        return value if value.startswith("0x") else "0x" + value
 
-        if not value.startswith("0x"):
-            value = "0x" + value
-
-        return value
-
-    # ----------------------------------------------------------------------
-    # Automatic registration
-    # ----------------------------------------------------------------------
-
-    def register_evidence(
-        self,
-        event_id: str,
-        evidence_hash: str,
-    ) -> dict:
-        """
-        Sign and submit one evidence proof using only the server environment
-        private key.
-
-        This function is completely automatic. No BridgeKey/user approval is
-        required for backend CCTV evidence registration.
-        """
-
+    def register_evidence(self, event_id: str, evidence_hash: str) -> dict:
+        """Sign and submit one Sentinel evidence proof to the MST contract."""
         if not MST_PRIVATE_KEY:
             raise BlockchainVerificationError(
-                "Automatic signing key not configured "
-                "(MST_PRIVATE_KEY missing)."
+                "Automatic signing key not configured (MST_PRIVATE_KEY missing)."
             )
 
         clean_hash = self._normalise_hash(evidence_hash)
 
-        # ------------------------------------------------------------------
-        # IMPORTANT:
-        #
-        # One backend wallet is signing all Sentinel registrations.
-        # Serialize the complete nonce -> build -> sign -> send -> receipt
-        # process so multiple detection threads cannot race each other.
-        # ------------------------------------------------------------------
         with _TRANSACTION_LOCK:
-
             try:
                 account = self.w3.eth.account.from_key(MST_PRIVATE_KEY)
-
                 event_id_bytes = Web3.keccak(text=event_id)
                 evidence_hash_bytes = bytes.fromhex(clean_hash)
 
-                # ----------------------------------------------------------
-                # Get the pending nonce.
-                #
-                # "pending" includes transactions that have already been
-                # submitted but are not mined yet.
-                # ----------------------------------------------------------
                 nonce = self.w3.eth.get_transaction_count(
                     account.address,
                     "pending",
                 )
-
-                # ----------------------------------------------------------
-                # Get current network gas price.
-                # ----------------------------------------------------------
                 gas_price = self.w3.eth.gas_price
 
                 if not gas_price or gas_price <= 0:
@@ -192,16 +114,10 @@ class BlockchainClient:
                         "MST RPC returned an invalid gas price."
                     )
 
-                # ----------------------------------------------------------
-                # Build contract transaction.
-                # ----------------------------------------------------------
                 transaction = (
                     self.contract
                     .functions
-                    .registerEvidence(
-                        event_id_bytes,
-                        evidence_hash_bytes,
-                    )
+                    .registerEvidence(event_id_bytes, evidence_hash_bytes)
                     .build_transaction(
                         {
                             "from": account.address,
@@ -212,53 +128,24 @@ class BlockchainClient:
                     )
                 )
 
-                # ----------------------------------------------------------
-                # Estimate gas.
-                # ----------------------------------------------------------
                 estimated_gas = self.w3.eth.estimate_gas(transaction)
-
-                # Add a small safety margin.
                 transaction["gas"] = max(
                     int(estimated_gas * 1.20),
                     estimated_gas + 10000,
                 )
 
-                # ----------------------------------------------------------
-                # Sign locally with backend private key.
-                # ----------------------------------------------------------
                 signed_tx = account.sign_transaction(transaction)
-
-                raw_tx = getattr(
-                    signed_tx,
-                    "raw_transaction",
-                    None,
-                )
-
+                raw_tx = getattr(signed_tx, "raw_transaction", None)
                 if raw_tx is None:
-                    raw_tx = getattr(
-                        signed_tx,
-                        "rawTransaction",
-                        None,
-                    )
-
+                    raw_tx = getattr(signed_tx, "rawTransaction", None)
                 if raw_tx is None:
                     raise BlockchainVerificationError(
                         "Could not extract signed transaction bytes."
                     )
 
-                # ----------------------------------------------------------
-                # Submit transaction.
-                # ----------------------------------------------------------
                 tx_hash_bytes = self.w3.eth.send_raw_transaction(raw_tx)
-
                 tx_hash = self._normalise_tx_hash(tx_hash_bytes)
 
-                # ----------------------------------------------------------
-                # Wait for mining.
-                #
-                # Use a longer timeout than before because Testnet nodes can
-                # occasionally take more than 30 seconds.
-                # ----------------------------------------------------------
                 receipt = self.w3.eth.wait_for_transaction_receipt(
                     tx_hash,
                     timeout=120,
@@ -267,27 +154,17 @@ class BlockchainClient:
 
                 if receipt.status != 1:
                     raise BlockchainVerificationError(
-                        "Transaction reverted on MST Testnet "
-                        f"(tx: {tx_hash})."
+                        f"Transaction reverted on MST Testnet (tx: {tx_hash})."
                     )
 
-                # ----------------------------------------------------------
-                # Read the mined block timestamp.
-                # ----------------------------------------------------------
-                block = self.w3.eth.get_block(
-                    receipt.blockNumber
-                )
-
+                block = self.w3.eth.get_block(receipt.blockNumber)
                 timestamp = (
                     block.timestamp
                     if block
-                    else int(
-                        datetime.now(timezone.utc).timestamp()
-                    )
+                    else int(datetime.now(timezone.utc).timestamp())
                 )
 
                 formatted_event_id = event_id_bytes.hex()
-
                 if not formatted_event_id.startswith("0x"):
                     formatted_event_id = "0x" + formatted_event_id
 
@@ -299,32 +176,21 @@ class BlockchainClient:
                     "contract_address": MST_CONTRACT_ADDRESS,
                     "blockchain_network": MST_CHAIN_NAME,
                     "registered_at": (
-                        datetime
-                        .fromtimestamp(
+                        datetime.fromtimestamp(
                             timestamp,
                             tz=timezone.utc,
                         )
                         .astimezone()
-                        .isoformat(
-                            timespec="seconds"
-                        )
+                        .isoformat(timespec="seconds")
                     ),
                 }
 
             except BlockchainVerificationError:
                 raise
-
             except Exception as error:
-                err_msg = str(error)
-
                 raise BlockchainVerificationError(
-                    "Automatic MST registration failed: "
-                    f"{err_msg}"
+                    f"Automatic MST registration failed: {error}"
                 ) from error
-
-    # ----------------------------------------------------------------------
-    # Verification
-    # ----------------------------------------------------------------------
 
     def verify_registration(
         self,
@@ -333,50 +199,36 @@ class BlockchainClient:
         transaction_hash: str,
     ) -> dict:
         """
-        Validate receipt log and contract state for one exact local event.
+        Validate the exact evidence hash from both the emitted event and
+        contract storage. The returned on_chain_evidence_hash is the value
+        actually read back from MST, so the UI can distinguish blockchain
+        proof from the locally calculated hash.
         """
-
-        expected_event_id = Web3.keccak(
-            text=event_id
-        )
-
-        expected_hash_clean = self._normalise_hash(
-            evidence_hash
-        )
+        expected_event_id = Web3.keccak(text=event_id)
+        expected_hash_clean = self._normalise_hash(evidence_hash)
 
         try:
-            receipt = self.w3.eth.get_transaction_receipt(
-                transaction_hash
-            )
-
+            receipt = self.w3.eth.get_transaction_receipt(transaction_hash)
         except Exception as error:
             raise BlockchainVerificationError(
                 "Transaction receipt is not available yet."
             ) from error
 
         if receipt is None:
-            raise BlockchainVerificationError(
-                "Transaction is still pending."
-            )
+            raise BlockchainVerificationError("Transaction is still pending.")
 
         if receipt.status != 1:
-            raise BlockchainVerificationError(
-                "Transaction reverted on MST Testnet."
-            )
+            raise BlockchainVerificationError("Transaction reverted on MST Testnet.")
 
         if (
             receipt.to is None
-            or receipt.to.lower()
-            != MST_CONTRACT_ADDRESS.lower()
+            or receipt.to.lower() != MST_CONTRACT_ADDRESS.lower()
         ):
             raise BlockchainVerificationError(
                 "Transaction was not sent to the SentinelEvidence contract."
             )
 
         try:
-            # --------------------------------------------------------------
-            # Decode EvidenceRegistered event from receipt.
-            # --------------------------------------------------------------
             logs = (
                 self.contract
                 .events
@@ -388,11 +240,8 @@ class BlockchainClient:
                 (
                     log
                     for log in logs
-                    if log["args"]["eventId"]
-                    == expected_event_id
-                    and log["args"]["evidenceHash"]
-                    .hex()
-                    .lower()
+                    if log["args"]["eventId"] == expected_event_id
+                    and log["args"]["evidenceHash"].hex().lower()
                     == expected_hash_clean
                 ),
                 None,
@@ -400,18 +249,10 @@ class BlockchainClient:
 
             if matching_log is None:
                 raise BlockchainVerificationError(
-                    "EvidenceRegistered event does not match "
-                    "this Sentinel event."
+                    "EvidenceRegistered event does not match this Sentinel event."
                 )
 
-            # --------------------------------------------------------------
-            # Read actual contract storage.
-            # --------------------------------------------------------------
-            (
-                on_chain_hash,
-                timestamp,
-                registered_by,
-            ) = (
+            on_chain_hash, timestamp, registered_by = (
                 self.contract
                 .functions
                 .getEvidence(expected_event_id)
@@ -420,50 +261,40 @@ class BlockchainClient:
 
         except BlockchainVerificationError:
             raise
-
         except Exception as error:
             raise BlockchainVerificationError(
                 "Could not read and validate the MST evidence record."
             ) from error
 
-        # --------------------------------------------------------------
-        # Verify hash + timestamp.
-        # --------------------------------------------------------------
         if timestamp == 0:
             raise BlockchainVerificationError(
                 "On-chain evidence record does not exist."
             )
 
-        if (
-            on_chain_hash.hex().lower()
-            != expected_hash_clean
-        ):
+        on_chain_hash_clean = on_chain_hash.hex().lower()
+        if on_chain_hash_clean != expected_hash_clean:
             raise BlockchainVerificationError(
-                "On-chain evidence hash does not match "
-                "this Sentinel event."
+                "On-chain evidence hash does not match this Sentinel event."
             )
 
         formatted_event_id = expected_event_id.hex()
-
         if not formatted_event_id.startswith("0x"):
             formatted_event_id = "0x" + formatted_event_id
 
         return {
             "blockchain_event_id": formatted_event_id,
             "registered_at": (
-                datetime
-                .fromtimestamp(
+                datetime.fromtimestamp(
                     timestamp,
                     tz=timezone.utc,
                 )
                 .astimezone()
-                .isoformat(
-                    timespec="seconds"
-                )
+                .isoformat(timespec="seconds")
             ),
             "registered_by": registered_by,
             "transaction_hash": transaction_hash,
             "block_number": receipt.blockNumber,
             "contract_address": MST_CONTRACT_ADDRESS,
             "blockchain_network": MST_CHAIN_NAME,
+            "on_chain_evidence_hash": "0x" + on_chain_hash_clean,
         }
