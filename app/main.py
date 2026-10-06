@@ -7,17 +7,24 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from .telegram_alert import send_telegram_alert, send_telegram_blockchain_update
 from .database import (
     add_event,
+    add_authorized_person,
+    add_authorized_embeddings,
     clear_events,
     clear_zone,
     confirm_blockchain_event,
     get_event,
+    get_authorized_faces,
+    get_authorized_persons,
+    delete_authorized_face,
+    update_authorized_person,
     initialise,
     load_zone,
     mark_blockchain_submitted,
@@ -76,6 +83,11 @@ class RTSPCamera(BaseModel):
     name: str = Field(default="IP Camera", min_length=1, max_length=80)
     username: str = ""
     password: str = ""
+
+
+class AuthorizedPersonUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    active: bool | None = None
 
 
 def rtsp_url(camera: RTSPCamera):
@@ -420,6 +432,7 @@ def startup():
     global event_worker_thread
 
     initialise()
+    state.set_authorized_faces(get_authorized_faces())
 
     event_worker_thread = threading.Thread(
         target=event_worker,
@@ -453,6 +466,122 @@ def status():
 @app.get("/api/events")
 def events():
     return recent_events()
+
+
+@app.get("/api/authorized-faces")
+def authorized_faces():
+    """Return person metadata only; embeddings never leave the server."""
+    return get_authorized_persons()
+
+
+async def face_encodings_from_uploads(files: list[UploadFile]) -> list[list[float]]:
+    """Validate enrolment images and return one encoding per image."""
+    if not 1 <= len(files) <= 3:
+        raise HTTPException(400, "Upload between one and three face photos.")
+    try:
+        import face_recognition
+    except Exception as error:
+        raise HTTPException(503, "Face recognition is unavailable. Install face_recognition and dlib to enable enrolment.") from error
+
+    encodings = []
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    for file in files:
+        if (file.content_type or "").lower() not in allowed_types:
+            raise HTTPException(400, "Use JPG, PNG, or WebP face photos.")
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(400, "One uploaded photo is empty.")
+        if len(raw) > 8 * 1024 * 1024:
+            raise HTTPException(413, "Each face photo must be 8 MB or smaller.")
+        image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise HTTPException(400, "One uploaded file is not a valid image.")
+        if min(image.shape[:2]) < 80:
+            raise HTTPException(400, "Face photos must be at least 80 pixels wide and high.")
+        try:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            locations = face_recognition.face_locations(rgb, number_of_times_to_upsample=1, model="hog")
+            if len(locations) == 0:
+                raise HTTPException(400, "No face found. Upload a clear, front-facing photo.")
+            if len(locations) != 1:
+                raise HTTPException(400, "Each registration photo must contain exactly one face.")
+            top, right, bottom, left = locations[0]
+            if min(right - left, bottom - top) < 40:
+                raise HTTPException(400, "The face is too small. Upload a clearer, closer photo.")
+            encoding = face_recognition.face_encodings(rgb, known_face_locations=locations, num_jitters=1)
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(400, "Could not read a face from one uploaded photo.") from error
+        if len(encoding) != 1:
+            raise HTTPException(400, "Could not generate a face embedding from one uploaded photo.")
+        encodings.append(encoding[0].tolist())
+    return encodings
+
+
+@app.post("/api/authorized-faces")
+async def register_authorized_face(
+    name: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(400, "Name cannot be empty.")
+    if len(clean_name) > 80:
+        raise HTTPException(400, "Name must be 80 characters or fewer.")
+
+    encodings = await face_encodings_from_uploads(files)
+    try:
+        person_id = add_authorized_person(clean_name, encodings)
+    except Exception as error:
+        if "UNIQUE constraint failed" in str(error):
+            raise HTTPException(409, "An authorized person with that name already exists.") from error
+        raise HTTPException(500, "Could not save the authorized person.") from error
+
+    # Refresh the in-memory snapshot immediately. The uploaded image bytes are
+    # intentionally discarded after encoding generation; no raw photo is saved.
+    state.set_authorized_faces(get_authorized_faces())
+
+    return {
+        "ok": True,
+        "id": person_id,
+        "name": clean_name,
+        "message": f"{clean_name} registered as an authorized person.",
+    }
+
+
+@app.post("/api/authorized-faces/{person_id}/images")
+async def add_authorized_face_images(person_id: int, files: list[UploadFile] = File(...)):
+    if not add_authorized_embeddings(person_id, await face_encodings_from_uploads(files)):
+        raise HTTPException(404, "Authorized person not found.")
+    state.set_authorized_faces(get_authorized_faces())
+    return {"ok": True, "message": "Face photos added."}
+
+
+@app.put("/api/authorized-faces/{person_id}")
+def edit_authorized_face(person_id: int, update: AuthorizedPersonUpdate):
+    name = update.name.strip() if update.name is not None else None
+    if name == "":
+        raise HTTPException(400, "Name cannot be empty.")
+    try:
+        changed = update_authorized_person(person_id, name, update.active)
+    except Exception as error:
+        if "UNIQUE constraint failed" in str(error):
+            raise HTTPException(409, "An authorized person with that name already exists.") from error
+        raise HTTPException(500, "Could not update the authorized person.") from error
+    if not changed:
+        raise HTTPException(404, "Authorized person not found or no changes supplied.")
+    state.set_authorized_faces(get_authorized_faces())
+    return {"ok": True}
+
+
+@app.delete("/api/authorized-faces/{face_id}")
+def remove_authorized_face(face_id: int):
+    if not delete_authorized_face(face_id):
+        raise HTTPException(404, "Authorized person not found.")
+
+    state.set_authorized_faces(get_authorized_faces())
+    return {"ok": True, "message": "Authorized person removed."}
 
 
 @app.get("/api/blockchain/config")

@@ -51,6 +51,114 @@ function feedState(on) {
     paint();
 }
 
+// ============================================================
+// AUTHORIZED PERSONS
+// ============================================================
+
+function authorizedSay(text, error = false) {
+    const target = $("authorizedMessage");
+    target.textContent = text || "";
+    target.classList.toggle("error", error);
+}
+
+function renderAuthorized(persons) {
+    const list = $("authorizedList");
+    list.replaceChildren();
+    if (!persons.length) {
+        list.innerHTML = '<p class="muted">No authorized persons registered.</p>';
+        return;
+    }
+    persons.forEach(person => {
+        const row = document.createElement("div");
+        row.className = "authorized-person" + (person.active ? "" : " inactive");
+        const info = document.createElement("div");
+        info.innerHTML = `<div class="authorized-person-name"><span class="authorized-check">${person.active ? "✓" : "○"}</span></div><p class="muted">${person.image_count} face ${person.image_count === 1 ? "embedding" : "embeddings"} · ${person.active ? "Active" : "Disabled"}</p>`;
+        info.querySelector(".authorized-person-name").append(document.createTextNode(person.name));
+        const actions = document.createElement("div");
+        actions.className = "authorized-actions";
+        [["Edit", () => editAuthorizedPerson(person)], ["Add Photos", () => addAuthorizedPhotos(person)], [person.active ? "Disable" : "Enable", () => toggleAuthorizedPerson(person)], ["Delete", () => deleteAuthorizedPerson(person)]].forEach(([label, handler]) => {
+            const button = document.createElement("button");
+            button.className = "ghost authorized-remove";
+            button.textContent = label;
+            button.onclick = handler;
+            actions.append(button);
+        });
+        row.append(info, actions);
+        list.append(row);
+    });
+}
+
+async function registerAuthorizedPerson() {
+    const name = $("authorizedName").value.trim();
+    const files = [...$("authorizedPhoto").files];
+    if (!name || !files.length) return authorizedSay("Enter a name and choose one to three face photos.", true);
+    if (files.length > 3) return authorizedSay("Choose no more than three face photos.", true);
+    const data = new FormData();
+    data.append("name", name);
+    files.forEach(file => data.append("files", file));
+    try {
+        $("registerAuthorized").disabled = true;
+        await endpoint("/api/authorized-faces", { method: "POST", body: data });
+        $("authorizedName").value = "";
+        $("authorizedPhoto").value = "";
+        authorizedSay(`${name} is now authorized.`);
+        await refreshAuthorized();
+    } catch (error) {
+        authorizedSay(error.message, true);
+    } finally {
+        $("registerAuthorized").disabled = false;
+    }
+}
+
+async function refreshAuthorized() {
+    try { renderAuthorized(await endpoint("/api/authorized-faces")); } catch (_) { /* dashboard stays available */ }
+}
+
+async function editAuthorizedPerson(person) {
+    const name = prompt("Authorized person name", person.name);
+    if (name === null || !name.trim()) return;
+    try {
+        await endpoint(`/api/authorized-faces/${person.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name.trim() }) });
+        await refreshAuthorized();
+    } catch (error) { authorizedSay(error.message, true); }
+}
+
+function addAuthorizedPhotos(person) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/jpeg,image/png,image/webp";
+    input.multiple = true;
+    input.onchange = async () => {
+        const files = [...input.files];
+        if (!files.length) return;
+        if (files.length > 3) return authorizedSay("Choose no more than three face photos.", true);
+        const data = new FormData();
+        files.forEach(file => data.append("files", file));
+        try {
+            await endpoint(`/api/authorized-faces/${person.id}/images`, { method: "POST", body: data });
+            authorizedSay(`Face photos added for ${person.name}.`);
+            await refreshAuthorized();
+        } catch (error) { authorizedSay(error.message, true); }
+    };
+    input.click();
+}
+
+async function toggleAuthorizedPerson(person) {
+    try {
+        await endpoint(`/api/authorized-faces/${person.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ active: !person.active }) });
+        await refreshAuthorized();
+    } catch (error) { authorizedSay(error.message, true); }
+}
+
+async function deleteAuthorizedPerson(person) {
+    if (!confirm(`Delete ${person.name}? This only removes their authorization data.`)) return;
+    try {
+        await endpoint(`/api/authorized-faces/${person.id}`, { method: "DELETE" });
+        authorizedSay(`${person.name} was removed.`);
+        await refreshAuthorized();
+    } catch (error) { authorizedSay(error.message, true); }
+}
+
 
 // ============================================================
 // CAMERA / VIDEO
@@ -881,10 +989,39 @@ function renderBlockchainPanel(
 
         addChainDetail(
             panel,
-            "Hash",
+            "Local SHA-256",
             event.evidence_hash,
             true
-        );
+);
+if (
+    event.evidence_hash &&
+    event.on_chain_evidence_hash
+) {
+    const localHash =
+        event.evidence_hash
+            .replace(/^0x/, "")
+            .toLowerCase();
+
+    const chainHash =
+        event.on_chain_evidence_hash
+            .replace(/^0x/, "")
+            .toLowerCase();
+
+    addChainDetail(
+        panel,
+        "Hash Match",
+        localHash === chainHash
+            ? "✓ MATCHED"
+            : "✕ MISMATCH",
+        false
+    );
+}
+addChainDetail(
+    panel,
+    "On-Chain SHA-256",
+    event.on_chain_evidence_hash,
+    true
+);
 
         addChainDetail(
             panel,
@@ -1437,6 +1574,7 @@ async function refresh() {
         // appears live on the dashboard.
 
         render(events);
+        refreshAuthorized();
 
     } catch (_) {
         // Keep dashboard alive if one refresh fails.
@@ -1465,6 +1603,7 @@ actions();
 paint();
 
 refresh();
+refreshAuthorized();
 
 setInterval(
     refresh,

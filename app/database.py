@@ -60,6 +60,107 @@ def initialise():
         con.execute("""CREATE TABLE IF NOT EXISTS source_zones (
             source_key TEXT PRIMARY KEY, zone_json TEXT NOT NULL, updated_at TEXT NOT NULL
         )""")
+        # Face encodings are deliberately kept server-side.  A person may have
+        # multiple enrolment photos, so encodings are normalized instead of
+        # adding columns to the existing events table.
+        con.execute("""CREATE TABLE IF NOT EXISTS authorized_persons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS authorized_face_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL,
+            encoding_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(person_id) REFERENCES authorized_persons(id) ON DELETE CASCADE
+        )""")
+
+
+def _now():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def get_authorized_persons(include_inactive: bool = True):
+    query = """SELECT p.id, p.name, p.active, p.created_at, p.updated_at,
+                      COUNT(e.id) AS image_count
+               FROM authorized_persons p
+               LEFT JOIN authorized_face_embeddings e ON e.person_id = p.id"""
+    if not include_inactive:
+        query += " WHERE p.active = 1"
+    query += " GROUP BY p.id ORDER BY p.name COLLATE NOCASE"
+    with connection() as con:
+        return [dict(row) for row in con.execute(query).fetchall()]
+
+
+def get_authorized_faces():
+    """Return active encodings for the in-memory recognizer only."""
+    with connection() as con:
+        rows = con.execute("""SELECT e.id, p.id AS person_id, p.name, e.encoding_json
+                            FROM authorized_face_embeddings e
+                            JOIN authorized_persons p ON p.id = e.person_id
+                            WHERE p.active = 1""").fetchall()
+    return [
+        {"id": row["id"], "person_id": row["person_id"], "name": row["name"],
+         "encoding": json.loads(row["encoding_json"])}
+        for row in rows
+    ]
+
+
+def add_authorized_person(name: str, encodings: list[list[float]]):
+    now = _now()
+    with connection() as con:
+        cursor = con.execute(
+            "INSERT INTO authorized_persons (name, active, created_at, updated_at) VALUES (?, 1, ?, ?)",
+            (name, now, now),
+        )
+        person_id = cursor.lastrowid
+        con.executemany(
+            "INSERT INTO authorized_face_embeddings (person_id, encoding_json, created_at) VALUES (?, ?, ?)",
+            [(person_id, json.dumps(encoding, separators=(",", ":")), now) for encoding in encodings],
+        )
+    return person_id
+
+
+def add_authorized_embeddings(person_id: int, encodings: list[list[float]]):
+    now = _now()
+    with connection() as con:
+        exists = con.execute("SELECT 1 FROM authorized_persons WHERE id = ?", (person_id,)).fetchone()
+        if not exists:
+            return False
+        con.executemany(
+            "INSERT INTO authorized_face_embeddings (person_id, encoding_json, created_at) VALUES (?, ?, ?)",
+            [(person_id, json.dumps(encoding, separators=(",", ":")), now) for encoding in encodings],
+        )
+        con.execute("UPDATE authorized_persons SET updated_at = ? WHERE id = ?", (now, person_id))
+    return True
+
+
+def update_authorized_person(person_id: int, name: str | None = None, active: bool | None = None):
+    changes, values = [], []
+    if name is not None:
+        changes.append("name = ?")
+        values.append(name)
+    if active is not None:
+        changes.append("active = ?")
+        values.append(int(active))
+    if not changes:
+        return False
+    changes.append("updated_at = ?")
+    values.append(_now())
+    values.append(person_id)
+    with connection() as con:
+        result = con.execute(f"UPDATE authorized_persons SET {', '.join(changes)} WHERE id = ?", values)
+    return result.rowcount == 1
+
+
+def delete_authorized_face(person_id: int):
+    with connection() as con:
+        con.execute("DELETE FROM authorized_face_embeddings WHERE person_id = ?", (person_id,))
+        result = con.execute("DELETE FROM authorized_persons WHERE id = ?", (person_id,))
+    return result.rowcount == 1
 
 
 def load_zone(source_key: str):

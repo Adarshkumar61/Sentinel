@@ -30,11 +30,23 @@ class VisionState:
     people_in_zone: set = field(default_factory=set, init=False, repr=False)
     crowd_active: bool = field(default=False, init=False)
 
+    # Authorized-person recognition is an additional gate only. It does not
+    # replace YOLO/ByteTrack detection or the restricted-zone geometry.
+    authorized_faces: list = field(default_factory=list, init=False, repr=False)
+    authorized_faces_lock: object = field(default_factory=threading.Lock, init=False, repr=False)
+    recognition_cache: dict = field(default_factory=dict, init=False, repr=False)
+    recognition_interval: float = 0.9
+    recognition_threshold: float = 0.50
+    face_recognition_available: bool = field(default=False, init=False)
+    face_recognition_error: str | None = field(default=None, init=False)
+    _face_recognition_module: object = field(default=None, init=False, repr=False)
+
     def reset_tracking_state(self):
         """Called when a source changes so IDs cannot leak between cameras."""
         self.people_in_zone.clear()
         self.crowd_active = False
         self.alert_cooldowns.clear()
+        self.recognition_cache.clear()
 
     def clear_zone_state(self):
         """A zone replacement must not retain entry state from the old zone."""
@@ -77,6 +89,157 @@ class VisionState:
             return False
         self.alert_cooldowns[key] = now
         return True
+
+    def set_authorized_faces(self, faces: list):
+        """Replace the in-memory authorized-face snapshot after DB changes."""
+        clean = []
+        for face in faces or []:
+            try:
+                encoding = [float(value) for value in face["encoding"]]
+                if len(encoding) != 128:
+                    continue
+                clean.append(
+                    {
+                        "id": int(face["id"]),
+                        "name": str(face["name"]),
+                        "encoding": encoding,
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        with self.authorized_faces_lock:
+            self.authorized_faces = clean
+            self.recognition_cache.clear()
+
+        print(f"Authorized face embeddings loaded: {len(clean)}")
+
+    def load_face_recognition(self):
+        """Load face_recognition only when an authorized identity exists."""
+        if self._face_recognition_module is not None:
+            return self._face_recognition_module
+
+        if self.face_recognition_error:
+            return None
+
+        try:
+            import face_recognition
+
+            self._face_recognition_module = face_recognition
+            self.face_recognition_available = True
+            print("face_recognition engine ready.")
+            return face_recognition
+        except Exception as error:
+            self.face_recognition_error = str(error)
+            self.face_recognition_available = False
+            print(f"face_recognition unavailable; identities remain unknown: {error}")
+            return None
+
+    def _authorized_snapshot(self):
+        with self.authorized_faces_lock:
+            return list(self.authorized_faces)
+
+    def _recognize_face(self, face_image):
+        """Return the registered name or None for an unknown/unusable face."""
+        face_recognition = self.load_face_recognition()
+        if face_recognition is None:
+            return None
+
+        if face_image is None or getattr(face_image, "size", 0) == 0:
+            return None
+
+        try:
+            # face_recognition expects RGB, while OpenCV supplies BGR.
+            rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+
+            # Keep CPU work bounded. Recognition is already throttled per track.
+            max_width = 500
+            if rgb.shape[1] > max_width:
+                scale = max_width / rgb.shape[1]
+                rgb = cv2.resize(
+                    rgb,
+                    (max_width, max(1, int(rgb.shape[0] * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            locations = face_recognition.face_locations(
+                rgb,
+                number_of_times_to_upsample=1,
+                model="hog",
+            )
+
+            if len(locations) != 1:
+                return None
+
+            encodings = face_recognition.face_encodings(
+                rgb,
+                known_face_locations=locations,
+                num_jitters=1,
+            )
+            if not encodings:
+                return None
+
+            unknown_encoding = encodings[0]
+            known = self._authorized_snapshot()
+            if not known:
+                return None
+
+            known_encodings = [face["encoding"] for face in known]
+            distances = face_recognition.face_distance(
+                known_encodings,
+                unknown_encoding,
+            )
+            if len(distances) == 0:
+                return None
+
+            best_index = int(np.argmin(distances))
+            best_distance = float(distances[best_index])
+
+            if best_distance <= self.recognition_threshold:
+                return known[best_index]["name"]
+
+            return None
+        except Exception as error:
+            # Recognition is never allowed to break YOLO/ByteTrack.
+            print(f"Face recognition error: {error}")
+            return None
+
+    def recognize_authorized_person(self, frame, person_box, cache_key: str):
+        """
+        Return (checked, name).
+
+        checked=False means the per-track recognition interval has not expired.
+        checked=True/name=None means the person is unknown/unusable.
+        """
+        now = time.monotonic()
+        cached = self.recognition_cache.get(cache_key)
+        if cached and now - cached[0] < self.recognition_interval:
+            return True, cached[1]
+
+        if not self._authorized_snapshot():
+            return True, None
+
+        x1, y1, x2, y2 = person_box
+        height, width = frame.shape[:2]
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(width, int(x2)), min(height, int(y2))
+        person = frame[y1:y2, x1:x2]
+
+        if person.size:
+            # The face is normally in the upper portion of a person box.
+            face_image = person[:max(1, int(person.shape[0] * 0.80)), :]
+        else:
+            face_image = None
+
+        name = self._recognize_face(face_image)
+        self.recognition_cache[cache_key] = (now, name)
+
+        if name:
+            print(f"AUTHORIZED: {name} [{cache_key}]")
+        else:
+            print(f"UNKNOWN FACE [{cache_key}]")
+
+        return True, name
 
     def capture_face(self, frame, person_box):
         """Detect and return the largest visible face only at alert time."""
@@ -148,6 +311,7 @@ class VisionState:
 
         people = 0
         active_zone_ids = set()
+        active_track_ids = set()
         frame = frame.copy()
         if zone is not None:
             overlay = frame.copy()
@@ -163,8 +327,13 @@ class VisionState:
             x1, y1, x2, y2 = (int(value) for value in coordinates)
             label = self.class_names.get(class_id, str(class_id)).title()
             is_person = class_id == 0
-            foot_point = ((x1 + x2) // 2, y2) 
-            in_zone = is_person and zone is not None and cv2.pointPolygonTest(zone, foot_point, False) >= 0
+            # The detector box often extends below the visible feet (as in a
+            # close webcam view).  A feet-only test then misses a person whose
+            # body is clearly inside the painted restricted area.  Use a stable
+            # lower-torso anchor instead: it represents the person entering
+            # the zone without triggering merely because their head overlaps it.
+            zone_anchor = ((x1 + x2) // 2, y1 + int((y2 - y1) * 0.65))
+            in_zone = is_person and zone is not None and cv2.pointPolygonTest(zone, zone_anchor, False) >= 0
             color = (0, 40, 255) if in_zone else ((35, 220, 90) if is_person else (255, 185, 40))
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             suffix = f" #{track_id}" if track_id is not None else ""
@@ -172,20 +341,41 @@ class VisionState:
             if is_person:
                 people += 1
                 zone_key = str(track_id) if track_id is not None else f"box-{x1}-{y1}"
+                active_track_ids.add(zone_key)
+                # Identity is evaluated independently from zone rules and
+                # cached per ByteTrack ID, avoiding per-frame face work.
+                _, authorized_name = self.recognize_authorized_person(
+                    raw_frame, (x1, y1, x2, y2),
+                    f"source:{self.source_name}|track:{zone_key}",
+                )
+                identity_label = f"{authorized_name} • AUTHORIZED" if authorized_name else "UNKNOWN PERSON"
+                identity_color = (50, 235, 150) if authorized_name else (120, 190, 230)
+                cv2.putText(frame, identity_label, (x1, min(height - 12, y2 + 20)), cv2.FONT_HERSHEY_SIMPLEX, .42, identity_color, 1)
                 if in_zone:
                     active_zone_ids.add(zone_key)
                 # Keep evidence fresh while someone remains in the restricted
                 # area. The per-track cooldown prevents frame-by-frame spam,
                 # while allowing a new capture every configured interval.
-                if in_zone and self.should_alert(f"zone-{zone_key}", self.alert_cooldown):
-                    face = self.capture_face(raw_frame, (x1, y1, x2, y2))
-                    body = self.capture_body(raw_frame, (x1, y1, x2, y2))
-                    face_note = " Face captured." if face is not None else " Face not visible."
-                    body_note = " Full-body evidence captured." if body is not None else ""
-                    action = "entered" if zone_key not in self.people_in_zone else "remains in"
-                    events.append(("Restricted Area Entry", f"Person #{track_id} {action} the restricted zone.{face_note}{body_note}", "critical", face, body))
+                if in_zone:
+                    # Authorization enriches identity only. Restricted-zone
+                    # policy remains in force for authorized and unknown people.
+                    if self.should_alert(f"zone-{zone_key}", self.alert_cooldown):
+                        face = self.capture_face(raw_frame, (x1, y1, x2, y2))
+                        body = self.capture_body(raw_frame, (x1, y1, x2, y2))
+                        face_note = " Face captured." if face is not None else " Face not visible."
+                        body_note = " Full-body evidence captured." if body is not None else ""
+                        action = "entered" if zone_key not in self.people_in_zone else "remains in"
+                        identity_note = f" Identity: {authorized_name} (authorized)." if authorized_name else " Identity: unknown/unrecognized."
+                        events.append(("Restricted Area Entry", f"Person #{track_id} {action} the restricted zone.{identity_note}{face_note}{body_note}", "critical", face, body))
 
         self.people_in_zone = active_zone_ids
+        stale_keys = [
+            key for key in self.recognition_cache
+            if key.rsplit("|track:", 1)[-1] not in active_track_ids
+        ]
+        for key in stale_keys:
+            self.recognition_cache.pop(key, None)
+
         self.person_count = people
         if people > self.crowd_threshold and not self.crowd_active and self.should_alert("crowd", self.alert_cooldown):
             # Event consumers always unpack five fields: type, details,
