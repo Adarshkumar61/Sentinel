@@ -30,7 +30,6 @@ class VisionState:
     people_in_zone: set = field(default_factory=set, init=False, repr=False)
     crowd_active: bool = field(default=False, init=False)
 
-<<<<<<< HEAD
     # Authorized-person recognition is an additional gate only. It does not
     # replace YOLO/ByteTrack detection or the restricted-zone geometry.
     authorized_faces: list = field(default_factory=list, init=False, repr=False)
@@ -39,37 +38,15 @@ class VisionState:
     recognition_interval: float = 0.9
     recognition_threshold: float = 0.50
     face_recognition_available: bool = field(default=False, init=False)
-    face_recognition_error: str | None = field(default=None, init=False)
+    face_recognition_error: str | None  = field(default=None, init=False)
     _face_recognition_module: object = field(default=None, init=False, repr=False)
-=======
-    # Browser webcams arrive through HTTP. Do not make the HTTP request wait
-    # for YOLO CPU inference; keep only the newest frame and let one worker
-    # process it in the background. This prevents Render latency from making
-    # the browser camera appear frozen while still using the same AI pipeline.
-    browser_condition: object = field(default_factory=threading.Condition, init=False, repr=False)
-    browser_latest_frame: object = field(default=None, init=False, repr=False)
-    browser_latest_annotated: object = field(default=None, init=False, repr=False)
-    browser_pending_events: list = field(default_factory=list, init=False, repr=False)
-    browser_worker: object = field(default=None, init=False, repr=False)
-    browser_session: int = field(default=0, init=False, repr=False)
->>>>>>> d447a3989ea7019f64ad27bf13371e71fbd3bfa3
 
     def reset_tracking_state(self):
         """Called when a source changes so IDs cannot leak between cameras."""
         self.people_in_zone.clear()
         self.crowd_active = False
         self.alert_cooldowns.clear()
-<<<<<<< HEAD
         self.recognition_cache.clear()
-=======
-        # Invalidate any old browser worker/frame when switching sources.
-        with self.browser_condition:
-            self.browser_session += 1
-            self.browser_latest_frame = None
-            self.browser_latest_annotated = None
-            self.browser_pending_events.clear()
-            self.browser_condition.notify_all()
->>>>>>> d447a3989ea7019f64ad27bf13371e71fbd3bfa3
 
     def clear_zone_state(self):
         """A zone replacement must not retain entry state from the old zone."""
@@ -350,7 +327,6 @@ class VisionState:
             x1, y1, x2, y2 = (int(value) for value in coordinates)
             label = self.class_names.get(class_id, str(class_id)).title()
             is_person = class_id == 0
-<<<<<<< HEAD
             # The detector box often extends below the visible feet (as in a
             # close webcam view).  A feet-only test then misses a person whose
             # body is clearly inside the painted restricted area.  Use a stable
@@ -358,10 +334,6 @@ class VisionState:
             # the zone without triggering merely because their head overlaps it.
             zone_anchor = ((x1 + x2) // 2, y1 + int((y2 - y1) * 0.65))
             in_zone = is_person and zone is not None and cv2.pointPolygonTest(zone, zone_anchor, False) >= 0
-=======
-            foot_point = ((x1 + x2) // 2, y2)
-            in_zone = is_person and zone is not None and cv2.pointPolygonTest(zone, foot_point, False) >= 0
->>>>>>> d447a3989ea7019f64ad27bf13371e71fbd3bfa3
             color = (0, 40, 255) if in_zone else ((35, 220, 90) if is_person else (255, 185, 40))
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             suffix = f" #{track_id}" if track_id is not None else ""
