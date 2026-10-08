@@ -192,11 +192,24 @@ function stopPreview() {
 
 async function startCamera() {
     try {
-        say("Starting webcam...");
+        say("Preparing YOLO detection engine...");
+        let result;
 
-        await endpoint("/api/camera/start", {
-            method: "POST"
-        });
+        // The server deliberately keeps the physical webcam closed until
+        // YOLO is warm. This avoids showing raw camera frames first and then
+        // jumping back to delayed annotated frames.
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+            result = await endpoint("/api/camera/start", { method: "POST" });
+            if (result?.ok) break;
+            if (!result?.warming) {
+                throw new Error(result?.message || "Could not prepare YOLO.");
+            }
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
+
+        if (!result?.ok) {
+            throw new Error("YOLO is taking too long to start. Please try again.");
+        }
 
         feedState(true);
         preview();

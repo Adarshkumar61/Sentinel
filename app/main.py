@@ -8,11 +8,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-<<<<<<< HEAD
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-=======
-from fastapi import FastAPI, File, HTTPException, UploadFile
->>>>>>> d447a3989ea7019f64ad27bf13371e71fbd3bfa3
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -361,7 +357,6 @@ def save_body_capture(body_image):
 def startup():
     global event_worker_thread
     initialise()
-<<<<<<< HEAD
     state.set_authorized_faces(get_authorized_faces())
 
     event_worker_thread = threading.Thread(
@@ -369,12 +364,18 @@ def startup():
         daemon=True,
         name="sentinel-event-worker",
     )
-=======
-    event_worker_thread = threading.Thread(target=event_worker, daemon=True, name="sentinel-event-worker")
->>>>>>> d447a3989ea7019f64ad27bf13371e71fbd3bfa3
     event_worker_thread.start()
+
+    # Keep webcam startup responsive: loading YOLO can take several seconds
+    # on a CPU, so warm it in the background while the dashboard is idle.
+    # The capture loop continues to publish real frames during this warm-up.
+    threading.Thread(
+        target=state.load_model,
+        daemon=True,
+        name="sentinel-yolo-warmup",
+    ).start()
     print("Sentinel AI started.")
-    print("Background event worker started.")
+    print("Background event worker and YOLO warm-up started.")
 
 
 @app.on_event("shutdown")
@@ -607,6 +608,10 @@ def start_browser_camera():
         release_active_capture()
         with stream_lock:
             latest_jpeg = None
+
+        # Begin loading YOLO before the browser uploads its first frame. In
+        # browser mode this is asynchronous, so it cannot delay camera start.
+        state.load_model()
     return {"ok": True, "message": "Browser webcam ready."}
 
 
@@ -660,6 +665,23 @@ async def process_browser_frame(file: UploadFile = File(...)):
 
 @app.post("/api/camera/start")
 def start_camera():
+    # Do not open the webcam and then make the user watch unprocessed frames
+    # while YOLO initialises. The dashboard polls this short-lived warm-up
+    # response and starts capture only after the model is ready.
+    if state.model_error:
+        raise HTTPException(503, f"YOLO could not be loaded: {state.model_error}")
+    if state.model is None:
+        if not state.model_loading:
+            threading.Thread(
+                target=state.load_model,
+                daemon=True,
+                name="sentinel-yolo-warmup-retry",
+            ).start()
+        return {
+            "ok": False,
+            "warming": True,
+            "message": "Preparing YOLO detection engine...",
+        }
     if state.running and not isinstance(state.source, str):
         return {"ok": True, "message": "Camera is already running."}
     start_source(0, "Camera 01", "webcam", "webcam:0")

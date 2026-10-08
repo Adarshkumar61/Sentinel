@@ -35,11 +35,26 @@ class VisionState:
     authorized_faces: list = field(default_factory=list, init=False, repr=False)
     authorized_faces_lock: object = field(default_factory=threading.Lock, init=False, repr=False)
     recognition_cache: dict = field(default_factory=dict, init=False, repr=False)
-    recognition_interval: float = 0.9
-    recognition_threshold: float = 0.50
+    # A result belongs to a tracker ID, not to an individual frame.  Keeping
+    # it for a few seconds avoids re-running dlib/HOG on every camera frame.
+    recognition_interval: float = 3.0
+    # 0.54 remains conservative, while allowing normal webcam lighting and
+    # lens differences from an otherwise clear registration image.
+    recognition_threshold: float = 0.54
     face_recognition_available: bool = field(default=False, init=False)
-    face_recognition_error: str | None  = field(default=None, init=False)
+    face_recognition_error: str | None = field(default=None, init=False)
     _face_recognition_module: object = field(default=None, init=False, repr=False)
+
+    # Browser webcams arrive through HTTP. Do not make the HTTP request wait
+    # for YOLO CPU inference; keep only the newest frame and let one worker
+    # process it in the background. This prevents Render latency from making
+    # the browser camera appear frozen while still using the same AI pipeline.
+    browser_condition: object = field(default_factory=threading.Condition, init=False, repr=False)
+    browser_latest_frame: object = field(default=None, init=False, repr=False)
+    browser_latest_annotated: object = field(default=None, init=False, repr=False)
+    browser_pending_events: list = field(default_factory=list, init=False, repr=False)
+    browser_worker: object = field(default=None, init=False, repr=False)
+    browser_session: int = field(default=0, init=False, repr=False)
 
     def reset_tracking_state(self):
         """Called when a source changes so IDs cannot leak between cameras."""
@@ -47,6 +62,13 @@ class VisionState:
         self.crowd_active = False
         self.alert_cooldowns.clear()
         self.recognition_cache.clear()
+        # Invalidate any old browser worker/frame when switching sources.
+        with self.browser_condition:
+            self.browser_session += 1
+            self.browser_latest_frame = None
+            self.browser_latest_annotated = None
+            self.browser_pending_events.clear()
+            self.browser_condition.notify_all()
 
     def clear_zone_state(self):
         """A zone replacement must not retain entry state from the old zone."""
@@ -225,13 +247,16 @@ class VisionState:
         x2, y2 = min(width, int(x2)), min(height, int(y2))
         person = frame[y1:y2, x1:x2]
 
-        if person.size:
-            # The face is normally in the upper portion of a person box.
-            face_image = person[:max(1, int(person.shape[0] * 0.80)), :]
-        else:
-            face_image = None
-
+        # Do not run the embedding model on a tiny, whole-person thumbnail.
+        # That was the main reason a person could be registered successfully
+        # but fail recognition on the live camera.  First isolate the largest
+        # visible face at the camera's native detail, then use an upper-body
+        # crop as a resilient fallback when Haar misses a face.
+        face_image = self.capture_face(frame, (x1, y1, x2, y2))
         name = self._recognize_face(face_image)
+        if name is None and person.size:
+            upper_person = person[:max(1, int(person.shape[0] * 0.72)), :]
+            name = self._recognize_face(upper_person)
         self.recognition_cache[cache_key] = (now, name)
 
         if name:
@@ -287,8 +312,10 @@ class VisionState:
         detections = []
 
         if self.model:
-            # 320 keeps CPU webcam/video streams responsive while retaining
-            # enough detail for person-focused surveillance.
+            # Browser frames are deliberately smaller: its display is local
+            # and real-time, while this worker only needs timely detections.
+            # Desktop/RTSP sources retain the more detailed 320px inference.
+            inference_size = 256 if self.source_name == "Browser Camera" else 320
             results = self.model.track(
                 frame,
                 persist=True,
@@ -296,7 +323,7 @@ class VisionState:
                 classes=list(self.target_classes),
                 conf=0.32,
                 iou=0.45,
-                imgsz=320,
+                imgsz=inference_size,
                 device=0 if self._cuda_available() else "cpu",
                 verbose=False,
             )
@@ -335,43 +362,141 @@ class VisionState:
             zone_anchor = ((x1 + x2) // 2, y1 + int((y2 - y1) * 0.65))
             in_zone = is_person and zone is not None and cv2.pointPolygonTest(zone, zone_anchor, False) >= 0
             color = (0, 40, 255) if in_zone else ((35, 220, 90) if is_person else (255, 185, 40))
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             suffix = f" #{track_id}" if track_id is not None else ""
-            cv2.putText(frame, f"{label}{suffix} {confidence:.0%}", (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 2)
+            if not is_person:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"{label}{suffix} {confidence:.0%}", (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 2)
+                continue
+
             if is_person:
-                people += 1
-                zone_key = str(track_id) if track_id is not None else f"box-{x1}-{y1}"
+                zone_key = (
+                    str(track_id)
+                    if track_id is not None
+                    else f"box-{x1}-{y1}"
+                )
+
+                # =====================================================
+                # AUTHORIZATION CHECK
+                # =====================================================
+                # Recognition runs for every tracked person, including one
+                # outside the painted zone, so an authorized name appears as
+                # soon as that person enters the camera frame.  The result is
+                # cached per track, so this does not become per-frame work.
+                # =====================================================
+
+                authorized_name = None
+
+                # Retain recognition results while this ByteTrack ID is
+                # alive.  Previously this set was never populated, so the
+                # cache was discarded at the end of every frame.
                 active_track_ids.add(zone_key)
-                # Identity is evaluated independently from zone rules and
-                # cached per ByteTrack ID, avoiding per-frame face work.
                 _, authorized_name = self.recognize_authorized_person(
-                    raw_frame, (x1, y1, x2, y2),
+                    raw_frame,
+                    (x1, y1, x2, y2),
                     f"source:{self.source_name}|track:{zone_key}",
                 )
-                identity_label = f"{authorized_name} • AUTHORIZED" if authorized_name else "UNKNOWN PERSON"
-                identity_color = (50, 235, 150) if authorized_name else (120, 190, 230)
-                cv2.putText(frame, identity_label, (x1, min(height - 12, y2 + 20)), cv2.FONT_HERSHEY_SIMPLEX, .42, identity_color, 1)
+
+                # =====================================================
+                # AUTHORIZED PERSON
+                # =====================================================
+                if authorized_name:
+                    # Show a positive, non-alert label so operators can see
+                    # that the person was intentionally ignored.
+                    cv2.putText(
+                        frame,
+                        f"AUTHORIZED: {authorized_name}",
+                        (x1, max(22, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        .52,
+                        (50, 235, 150),
+                        2,
+                    )
+                    # Authorized person is ignored by Sentinel
+                    # security-event logic.
+                    #
+                    # No:
+                    # - restricted-zone alert
+                    # - evidence capture
+                    # - Telegram alert
+                    # - security event
+                    # - crowd contribution
+                    #
+                    # YOLO/ByteTrack continues tracking visually.
+                    continue
+
+                # =====================================================
+                # UNKNOWN / UNAUTHORIZED PERSON
+                # =====================================================
+
+                # Only unknown/unauthorized people contribute to
+                # Sentinel's security-event person count.
+                people += 1
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"{label}{suffix} {confidence:.0%}", (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 2)
+
                 if in_zone:
                     active_zone_ids.add(zone_key)
-                # Keep evidence fresh while someone remains in the restricted
-                # area. The per-track cooldown prevents frame-by-frame spam,
-                # while allowing a new capture every configured interval.
-                if in_zone:
-                    # Authorization enriches identity only. Restricted-zone
-                    # policy remains in force for authorized and unknown people.
-                    if self.should_alert(f"zone-{zone_key}", self.alert_cooldown):
-                        face = self.capture_face(raw_frame, (x1, y1, x2, y2))
-                        body = self.capture_body(raw_frame, (x1, y1, x2, y2))
-                        face_note = " Face captured." if face is not None else " Face not visible."
-                        body_note = " Full-body evidence captured." if body is not None else ""
-                        action = "entered" if zone_key not in self.people_in_zone else "remains in"
-                        identity_note = f" Identity: {authorized_name} (authorized)." if authorized_name else " Identity: unknown/unrecognized."
-                        events.append(("Restricted Area Entry", f"Person #{track_id} {action} the restricted zone.{identity_note}{face_note}{body_note}", "critical", face, body))
 
+                    # Restricted-zone alert only for unauthorized/
+                    # unknown people.
+                    if self.should_alert(
+                        f"zone-{zone_key}",
+                        self.alert_cooldown
+                    ):
+                        face = self.capture_face(
+                            raw_frame,
+                            (x1, y1, x2, y2)
+                        )
+
+                        body = self.capture_body(
+                            raw_frame,
+                            (x1, y1, x2, y2)
+                        )
+
+                        face_note = (
+                            " Face captured."
+                            if face is not None
+                            else " Face not visible."
+                        )
+
+                        body_note = (
+                            " Full-body evidence captured."
+                            if body is not None
+                            else ""
+                        )
+
+                        action = (
+                            "entered"
+                            if zone_key not in self.people_in_zone
+                            else "remains in"
+                        )
+
+                        events.append(
+                            (
+                                "Restricted Area Entry",
+                                (
+                                    f"Person #{track_id} {action} "
+                                    f"the restricted zone."
+                                    f"{face_note}{body_note}"
+                                ),
+                                "critical",
+                                face,
+                                body,
+                            )
+                        )
         self.people_in_zone = active_zone_ids
         stale_keys = [
             key for key in self.recognition_cache
-            if key.rsplit("|track:", 1)[-1] not in active_track_ids
+            if (
+                key.rsplit("|track:", 1)[-1] not in active_track_ids
+                # Browser fallback recognition runs after this method through
+                # the compatibility wrapper.  Its stable pseudo-track must
+                # survive this cleanup until the source is reset.
+                and not (
+                    self.source_name == "Browser Camera"
+                    and key.endswith("|track:face-fallback")
+                )
+            )
         ]
         for key in stale_keys:
             self.recognition_cache.pop(key, None)

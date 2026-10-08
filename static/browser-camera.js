@@ -1,4 +1,9 @@
 (() => {
+    // Browser-camera mode was replaced by the local OpenCV webcam path.
+    // Keep this guard so a stale HTML page cannot override window.startCamera
+    // and re-enable getUserMedia/Chrome's camera-permission indicator.
+    if (window.__sentinelUseBrowserCamera !== true) return;
+
     let browserStream = null;
     let browserVideo = null;
     let browserCanvas = null;
@@ -14,10 +19,10 @@
         const stream = $id("stream");
         if (!stream) return;
         processedStreamReady = false;
+        // Never replace the local video with a server MJPEG stream: network
+        // inference is necessarily older than the camera and looks laggy.
         stream.style.opacity = "0";
-        stream.style.position = "relative";
-        stream.style.zIndex = "2";
-        stream.src = "/api/stream?browser=" + Date.now();
+        stream.removeAttribute("src");
     }
 
     function ensureLocalPreview() {
@@ -93,7 +98,9 @@
                 return;
             }
 
-            const maxWidth = 640;
+            // 416px is enough for the 256px browser inference worker and
+            // keeps JPEG creation/upload quick on modest devices.
+            const maxWidth = 416;
             const scale = Math.min(1, maxWidth / browserVideo.videoWidth);
             browserCanvas.width = Math.max(1, Math.round(browserVideo.videoWidth * scale));
             browserCanvas.height = Math.max(1, Math.round(browserVideo.videoHeight * scale));
@@ -103,7 +110,7 @@
                 desynchronized: true
             });
             ctx.drawImage(browserVideo, 0, 0, browserCanvas.width, browserCanvas.height);
-            browserCanvas.toBlob(resolve, "image/jpeg", 0.65);
+            browserCanvas.toBlob(resolve, "image/jpeg", 0.55);
         });
     }
 
@@ -146,7 +153,9 @@
             await sendOneFrame();
             if (!browserSending || browserStopRequested) break;
             await new Promise(resolve => {
-                sendTimer = setTimeout(resolve, 180);
+                // AI receives only current samples; the local preview remains
+                // at the camera's native frame rate with no network delay.
+                sendTimer = setTimeout(resolve, 250);
             });
         }
     }
@@ -166,8 +175,8 @@
                 audio: false,
                 video: {
                     facingMode: "user",
-                    width: { ideal: 640, max: 1280 },
-                    height: { ideal: 480, max: 720 },
+                    width: { ideal: 640, max: 640 },
+                    height: { ideal: 480, max: 480 },
                     frameRate: { ideal: 15, max: 20 }
                 }
             });
@@ -190,7 +199,6 @@
             browserSending = true;
             browserStopRequested = false;
 
-            if (typeof stopPreview === "function") stopPreview();
             setFeedStream();
 
             say("● CAMERA LIVE  ● AI ANALYSIS STARTING  ● RESTRICTED-ZONE MONITORING");
@@ -222,20 +230,6 @@
         feedState(false);
         say("Camera stopped.");
     };
-
-    // When the backend's annotated MJPEG stream produces its first frame,
-    // place it over the local preview. Until then the real webcam remains
-    // visible, giving immediate feedback while YOLO warms up.
-    const processedImage = $id("stream");
-    if (processedImage) {
-        processedImage.addEventListener("load", () => {
-            if (browserSending && !processedStreamReady) {
-                processedStreamReady = true;
-                processedImage.style.opacity = "1";
-                say("● CAMERA LIVE  ● AI ANALYSIS ACTIVE  ● RESTRICTED-ZONE MONITORING");
-            }
-        });
-    }
 
     const originalSource = window.source;
     window.source = function browserAwareSource(key) {

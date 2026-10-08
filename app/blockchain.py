@@ -282,32 +282,6 @@ class BlockchainClient:
             formatted_event_id = "0x" + formatted_event_id
 
         return {
-<<<<<<< HEAD
-    "blockchain_event_id": formatted_event_id,
-    "registered_at": (
-        datetime
-        .fromtimestamp(
-            timestamp,
-            tz=timezone.utc,
-        )
-        .astimezone()
-        .isoformat(
-            timespec="seconds"
-        )
-    ),
-    "registered_by": registered_by,
-    "transaction_hash": transaction_hash,
-    "block_number": receipt.blockNumber,
-    "contract_address": MST_CONTRACT_ADDRESS,
-    "blockchain_network": MST_CHAIN_NAME,
-
-    "on_chain_evidence_hash": (
-        on_chain_hash.hex()
-        if isinstance(on_chain_hash, bytes)
-        else str(on_chain_hash)
-    ),
-}
-=======
             "blockchain_event_id": formatted_event_id,
             "registered_at": (
                 datetime.fromtimestamp(
@@ -324,4 +298,3 @@ class BlockchainClient:
             "blockchain_network": MST_CHAIN_NAME,
             "on_chain_evidence_hash": "0x" + on_chain_hash_clean,
         }
->>>>>>> d447a3989ea7019f64ad27bf13371e71fbd3bfa3

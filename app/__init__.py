@@ -59,6 +59,39 @@ def _browser_process_sync(self, frame):
     y1 = max(0, int(fy - fh * 0.4))
     y2 = min(frame.shape[0], int(fy + fh * 4.0))
 
+    zone = np.array([(int(x * frame.shape[1]), int(y * frame.shape[0])) for x, y in self.restricted_zone], np.int32) if len(self.restricted_zone) == 4 else None
+    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    foot = ((x1 + x2) // 2, y2)
+    in_zone = zone is not None and (cv2.pointPolygonTest(zone, center, False) >= 0 or cv2.pointPolygonTest(zone, foot, False) >= 0)
+
+    # The browser fallback used to create an alert directly from a Haar face
+    # box.  That bypassed the authorized-face gate completely, so registered
+    # people were reported as intruders.  Run the exact same gate used by the
+    # YOLO path before drawing/counting/alerting the fallback person.
+    # Match even outside the zone so the operator gets the authorized name
+    # immediately when the person is visible in the browser camera.
+    _, authorized_name = self.recognize_authorized_person(
+        frame,
+        (x1, y1, x2, y2),
+        "source:Browser Camera|track:face-fallback",
+    )
+
+    # An authorized person is deliberately absent from restricted-zone
+    # detection: no red box, name, count, evidence, or event.  The raw camera
+    # image remains live and the cached decision prevents recognition lag.
+    if authorized_name:
+        self.people_in_zone.discard("face-overlap")
+        cv2.putText(
+            annotated,
+            f"AUTHORIZED: {authorized_name}",
+            (x1, max(22, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .52,
+            (50, 235, 150),
+            2,
+        )
+        return annotated, events
+
     # Keep the real YOLO count when it exists; otherwise show the degraded
     # face/person count immediately while YOLO is loading or unavailable.
     if self.person_count == 0:
@@ -68,11 +101,6 @@ def _browser_process_sync(self, frame):
         cv2.putText(annotated, "Person (fallback) 99%", (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 2)
         cv2.putText(annotated, "PEOPLE: 1", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 3)
         cv2.putText(annotated, "PEOPLE: 1", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, .8, (20, 230, 100), 1)
-
-    zone = np.array([(int(x * frame.shape[1]), int(y * frame.shape[0])) for x, y in self.restricted_zone], np.int32) if len(self.restricted_zone) == 4 else None
-    center = ((x1 + x2) // 2, (y1 + y2) // 2)
-    foot = ((x1 + x2) // 2, y2)
-    in_zone = zone is not None and (cv2.pointPolygonTest(zone, center, False) >= 0 or cv2.pointPolygonTest(zone, foot, False) >= 0)
 
     if in_zone and not events and self.should_alert("zone-face-overlap", self.alert_cooldown):
         face = self.capture_face(frame, (x1, y1, x2, y2))
